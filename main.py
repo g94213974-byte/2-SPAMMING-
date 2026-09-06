@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
 """
-Telegram Mass Messaging Bot v6.4 FINAL ✨
-- v6.3+ per-account SPECIAL MESSAGE (only that id spams the pinned msg; others normal)
-- FIXED: Phone OTP loop — single sign_in, NO auto-resend, clean reset on expired code
-- Auto-remove EXPIRED admins from list + notify them
-- Owner can type CUSTOM admin time (1s .. any) in Admin List → ✍️ Custom Time
-- Targeted broadcast to a SINGLE user (by USER_ID)
-- Premium styled emoji UI
+Telegram Mass Messaging Bot v7.0 FINAL ✨
+- v6.4 features (special msg per account, phone OTP fix, targeted broadcast)
+- v7: 20s pre-expiry warning + auto-remove expired admins
+- v7: Expired user → "bot deleted" screen with PLAN buttons (owner-customizable)
+- v7: QR payment flow → screenshot → owner Accept/Reject/Block
+- v7: Referral system (20% commission, balance-based purchase)
 """
 import sys, os, asyncio, random, logging, json, threading, httpx, re, uuid
 from datetime import datetime, timedelta
@@ -52,6 +51,91 @@ running_tasks, stop_flags, account_clients, account_stats, phone_login_states, d
 data_file = "bot_data.json"
 SHOW_START_TO_OTHERS = True
 
+# ================= v7 STORE / PAYMENT / REFERRAL =================
+PLANS_FILE = "plans.json"
+PAYMENTS_FILE = "payments.json"
+REFS_FILE = "referrals.json"
+QR_FILE = "qr_config.json"
+BALANCES_FILE = "balances.json"
+BLOCKED_FILE = "blocked_users.json"
+WARN_BEFORE_SEC = 20
+warned_users = set()
+
+def load_json(fname, default):
+    try: return json.load(open(fname)) if os.path.exists(fname) else default
+    except: return default
+def save_json(fname, data):
+    try: json.dump(data, open(fname, 'w'), indent=2)
+    except: pass
+def load_plans(): return load_json(PLANS_FILE, [])
+def save_plans(p): save_json(PLANS_FILE, p)
+def load_qr(): return load_json(QR_FILE, {})
+def save_qr(d): save_json(QR_FILE, d)
+def is_blocked(uid): return uid in load_json(BLOCKED_FILE, [])
+def get_balance(uid): return float(load_json(BALANCES_FILE, {}).get(str(uid), 0))
+def add_balance(uid, amt):
+    b = load_json(BALANCES_FILE, {}); b[str(uid)] = get_balance(uid) + amt
+    save_json(BALANCES_FILE, b)
+def get_ref_code(uid):
+    r = load_json(REFS_FILE, {})
+    if str(uid) not in r:
+        r[str(uid)] = {'code': uuid.uuid4().hex[:8], 'referred': [], 'earnings': 0.0}
+        save_json(REFS_FILE, r)
+    return r[str(uid)]['code']
+def find_referrer_by_code(code):
+    r = load_json(REFS_FILE, {})
+    for uid_s, v in r.items():
+        if v.get('code') == code: return int(uid_s)
+    return None
+def get_referrer_of(uid):
+    r = load_json(REFS_FILE, {})
+    for uid_s, v in r.items():
+        if uid_s != str(uid) and uid in v.get('referred', []): return int(uid_s)
+    return None
+def set_referred(user_id, referrer_id):
+    if user_id == referrer_id: return
+    r = load_json(REFS_FILE, {})
+    get_ref_code(user_id); get_ref_code(referrer_id)
+    v = r[str(referrer_id)]
+    if user_id not in v.setdefault('referred', []):
+        v['referred'].append(user_id); save_json(REFS_FILE, r)
+
+async def activate_plan(user_id, days, plan_name="plan"):
+    nd = datetime.now() + timedelta(days=days)
+    admins = load_admins(); a = get_admin(user_id)
+    if a is None:
+        admins.append({'user_id': user_id, 'expires_at': nd.isoformat(), 'added_at': datetime.now().isoformat(),
+                       'updated_at': datetime.now().isoformat(), 'max_accounts': DEFAULT_ADMIN_LIMIT})
+    else:
+        cur = None
+        try: cur = datetime.fromisoformat(a['expires_at']) if a.get('expires_at') else None
+        except: cur = None
+        rem = (cur - datetime.now()) if (cur and cur > datetime.now()) else timedelta(0)
+        a['expires_at'] = (datetime.now() + rem + timedelta(days=days)).isoformat()
+        a['updated_at'] = datetime.now().isoformat()
+        for i, x in enumerate(admins):
+            if x['user_id'] == user_id: admins[i] = a
+    save_admins(admins)
+    warned_users.discard(user_id)
+    gg = get_admin(user_id)
+    try:
+        await notify_user(user_id, f"✅ *Payment confirmed!*\n\n💎 Plan: {plan_name}\n⏳ Your validity: {remaining_time_str(gg.get('expires_at') if gg else None)}")
+    except: pass
+
+def expired_panel_keyboard():
+    kb = []
+    for p in load_plans():
+        kb.append([InlineKeyboardButton(p['btn_name'], callback_data=f"buy_{p['plan_id']}")])
+    kb.append([InlineKeyboardButton("💰 Buy with referral balance", callback_data='ref_buy_menu')])
+    kb.append([InlineKeyboardButton("👥 My Referral", callback_data='ref_menu')])
+    return InlineKeyboardMarkup(kb)
+
+def expired_panel_text():
+    lines = ["🚫 *Bot access deleted!*\n\nYour plan has expired.\nContact admin 👉 @G18GamerBacko\n\n💎 *Available Plans:*"]
+    for p in load_plans():
+        lines.append(f"\n▫️ {p['name']} — ₹{p['price']} / {p['days']}d")
+    return "\n".join(lines)
+
 def load_names():
     try: return json.load(open(NAME_FILE)) if os.path.exists(NAME_FILE) else {}
     except: return {}
@@ -71,6 +155,11 @@ def admin_label(uid):
     if info and info.get('name'):
         return f"{info['name']} (ID: {uid})"
     return f"ID: {uid}"
+def get_names_short(uid):
+    info = load_names().get(str(uid))
+    if info and info.get('name'):
+        return info['name'][:14]
+    return str(uid)
 
 def load_user_speeds():
     try: return json.load(open(USER_SPEED_FILE)) if os.path.exists(USER_SPEED_FILE) else {}
@@ -324,7 +413,7 @@ def home():
     all_a = get_all_accounts()
     run = sum(1 for a in all_a if account_stats.get(a['id'],{}).get('running',False))
     sent = sum(account_stats.get(a['id'],{}).get('sent',0) for a in all_a)
-    return f"v6.4 FINAL ✨ | Accounts:{len(all_a)} | Active:{run}/{len(all_a)} | Sent:{sent} | Admins:{len(load_admins())}"
+    return f"v7.0 FINAL ✨ | Accounts:{len(all_a)} | Active:{run}/{len(all_a)} | Sent:{sent} | Admins:{len(load_admins())}"
 @web_app.route("/health")
 def health(): return "OK", 200
 def run_flask(): web_app.run(host="0.0.0.0", port=int(os.environ.get("PORT",10000)), debug=False, use_reloader=False)
@@ -506,31 +595,39 @@ def stop_accounts_of(u):
 def stop_all_accounts():
     for a in get_all_accounts(): stop_account(a['id'])
 
+# ================= v7 EXPIRY CHECKER (20s warning + auto-remove) =================
 async def admin_expiry_checker():
     while True:
         try:
-            await asyncio.sleep(60)
-            valid = {OWNER_ID}
-            admins = load_admins(); changed = False; keep = []
+            await asyncio.sleep(1)
+            admins = load_admins(); keep = []; changed = False
             for a in admins:
-                if is_valid_admin(a['user_id']):
-                    keep.append(a); valid.add(a['user_id'])
-                else:
+                uid = a['user_id']; exp = a.get('expires_at')
+                if not exp: keep.append(a); continue
+                try: rem = (datetime.fromisoformat(exp) - datetime.now()).total_seconds()
+                except: rem = 999999
+                if rem <= 0:
                     changed = True
-                    for acc in get_all_accounts(a['user_id']):
-                        if account_stats.get(acc['id'],{}).get('running',False):
-                            stop_account(acc['id'])
+                    for acc in get_all_accounts(uid):
+                        if account_stats.get(acc['id'], {}).get('running', False): stop_account(acc['id'])
                         await disconnect_client(acc['id'])
-                    try:
-                        await notify_user(a['user_id'], f"⛔ *Plan expired*\n\n{EXPIRED_MSG}")
+                    try: await notify_user(uid, f"⛔ *Plan expired*\n\n{EXPIRED_MSG}")
                     except: pass
+                    warned_users.discard(uid)
+                else:
+                    keep.append(a)
+                    if rem <= WARN_BEFORE_SEC and uid != OWNER_ID and uid not in warned_users:
+                        warned_users.add(uid)
+                        try: await notify_user(uid, f"⏳ Your plan expires in {int(rem)} seconds!\n\n{EXPIRED_MSG}")
+                        except: pass
             if changed: save_admins(keep)
+            valid = {OWNER_ID} | {a['user_id'] for a in keep if not a.get('expires_at') or (datetime.fromisoformat(a['expires_at']) > datetime.now() if a.get('expires_at') else True)}
             for acc in get_all_accounts():
                 oid = acc.get('owner_id', OWNER_ID)
-                if oid not in valid and account_stats.get(acc['id'],{}).get('running',False):
+                if oid not in valid and account_stats.get(acc['id'], {}).get('running', False):
                     stop_account(acc['id']); await disconnect_client(acc['id'])
         except Exception as e:
-            logger.error(f"expiry:{e}")
+            logger.error(f"expiry:{e}"); await asyncio.sleep(5)
 
 async def test_session_only(ss):
     c = None
@@ -577,7 +674,7 @@ def main_menu_text(u):
         cap = admin_max_accounts(u); cur = owner_acc_count(u)
         lim = f"\n🔢 Accounts: {cur}" if cap is None else f"\n🔢 Accounts: {cur}/{cap}"
         extra = exp + lim
-    return (f"✨ *Bot v6.4 FINAL* ✨\n{role}{extra}\n\n"
+    return (f"✨ *Bot v7.0 FINAL* ✨\n{role}{extra}\n\n"
             f"📊 Accounts: {len(accs)} (Running: {run})\n"
             f"⚡ Speed: {mn}-{mx}s | 🔄 Cycle: {cyc}s\n📨 Sent: {sent}")
 
@@ -585,11 +682,23 @@ async def start_command(u, c):
     uid = u.effective_user.id
     eu = u.effective_user
     record_user_info(uid, eu.first_name, eu.last_name, eu.username)
+    # ---- v7: referral deep link ----
+    args = u.message.text.split(maxsplit=1)
+    if len(args) > 1 and args[1].startswith('ref_'):
+        rid = find_referrer_by_code(args[1][4:])
+        if rid and rid != uid and get_referrer_of(uid) is None:
+            set_referred(uid, rid)
+            try:
+                await c.bot.send_message(rid, f"👥 New referral joined: {eu.first_name} (ID: {uid})")
+            except: pass
+    if is_blocked(uid):
+        await u.message.reply_text("🚫 You are blocked. Contact admin 👉 @G18GamerBacko"); return
     if is_owner(uid) or is_valid_admin(uid):
         refresh_account_stats(uid); preload_display_names(get_all_accounts(uid))
         await u.message.reply_text(main_menu_text(uid), parse_mode='Markdown', reply_markup=main_menu_keyboard(uid))
         return
-    if SHOW_START_TO_OTHERS: await u.message.reply_text("🤖 Private bot. Please contact the owner.")
+    # ---- v7: expired / normal user panel ----
+    await u.message.reply_text(expired_panel_text(), parse_mode='Markdown', reply_markup=expired_panel_keyboard())
 
 async def apply_admin_time(target, op, nd, q=None, text_ui=None):
     now = datetime.now()
@@ -653,13 +762,115 @@ async def button_click(u, c):
     q = u.callback_query; await q.answer(); uid = q.from_user.id
     frm = q.from_user
     record_user_info(uid, frm.first_name, frm.last_name, frm.username)
-    if not (is_owner(uid) or is_valid_admin(uid)):
+    d = q.data
+
+    # ---- v7: free callbacks available to everyone (incl. expired users) ----
+    ALLOWED_FREE_PREFIXES = ('buy_', 'paid_', 'refbuy_', 'back_start', 'ref_menu', 'ref_buy_menu')
+    ALLOWED_FREE_EXACT = ('payok_', 'payno_', 'payblock_')  # owner handled inside
+    is_free = any(d.startswith(x) for x in ALLOWED_FREE_PREFIXES) or any(d.startswith(x) for x in ALLOWED_FREE_EXACT)
+    if not (is_owner(uid) or is_valid_admin(uid)) and not is_free:
         if SHOW_START_TO_OTHERS: await q.edit_message_text("⛔ Access denied / expired.")
         else: await q.edit_message_text(" ")
         return
 
-    d = q.data
-    if d == 'start_all':
+    # ================= v7 BUY FLOW =================
+    if d.startswith('buy_'):
+        pid = d.replace('buy_', '')
+        plan = next((p for p in load_plans() if p['plan_id'] == pid), None)
+        if not plan:
+            await q.edit_message_text("❌ Plan unavailable", reply_markup=expired_panel_keyboard()); return
+        kb = [[InlineKeyboardButton("✅ I Have Paid", callback_data=f'paid_{pid}')]]
+        if get_balance(uid) >= float(plan['price']):
+            kb.append([InlineKeyboardButton(f"💰 Pay with balance (₹{plan['price']})", callback_data=f'refbuy_{pid}')])
+        kb.append([InlineKeyboardButton("🔙 Back", callback_data='back_start')])
+        cap = f"\n\n💎 {plan['name']}\n💸 Price: ₹{plan['price']}\n⏳ Duration: {plan['days']} days"
+        qr = load_qr()
+        try: await q.message.delete()
+        except: pass
+        if qr.get('photo'):
+            await c.bot.send_photo(uid, photo=qr['photo'], caption="💳 Pay via this QR" + cap, parse_mode='Markdown', reply_markup=InlineKeyboardMarkup(kb))
+        else:
+            await c.bot.send_message(uid, "💳 Pay to admin (QR not set yet)" + cap, parse_mode='Markdown', reply_markup=InlineKeyboardMarkup(kb))
+    elif d == 'back_start':
+        try: await q.message.delete()
+        except: pass
+        await c.bot.send_message(uid, expired_panel_text(), parse_mode='Markdown', reply_markup=expired_panel_keyboard())
+    elif d.startswith('paid_'):
+        pid = d.replace('paid_', '')
+        plan = next((p for p in load_plans() if p['plan_id'] == pid), None)
+        if not plan: return
+        c.user_data['awaiting'] = 'pay_screenshot'
+        c.user_data['pay_plan'] = pid
+        try: await q.message.delete()
+        except: pass
+        await c.bot.send_message(uid, "📸 Please send your payment screenshot.", reply_markup=BACK_KB)
+    elif d.startswith('refbuy_'):
+        pid = d.replace('refbuy_', '')
+        plan = next((p for p in load_plans() if p['plan_id'] == pid), None)
+        if not plan or get_balance(uid) < float(plan['price']):
+            await q.edit_message_text("❌ Insufficient balance", reply_markup=expired_panel_keyboard()); return
+        add_balance(uid, -float(plan['price']))
+        await activate_plan(uid, int(plan['days']), plan['name'])
+        ref = get_referrer_of(uid)
+        if ref:
+            comm = round(float(plan['price']) * 0.20, 2)
+            add_balance(ref, comm)
+            r = load_json(REFS_FILE, {}); r[str(ref)]['earnings'] = r[str(ref)].get('earnings', 0) + comm; save_json(REFS_FILE, r)
+            nm = load_names().get(str(uid), {}).get('name', str(uid))
+            try: await c.bot.send_message(ref, f"💰 You referred {nm}.\nThey bought '{plan['name']}' for ₹{plan['price']}.\n✅ 20% (₹{comm}) added to your balance.")
+            except: pass
+        try: await q.edit_message_text("✅ Plan activated with balance!", reply_markup=expired_panel_keyboard())
+        except: pass
+    elif d == 'ref_menu':
+        code = get_ref_code(uid)
+        me = await c.bot.get_me()
+        r = load_json(REFS_FILE, {}).get(str(uid), {})
+        await q.edit_message_text(
+            f"👥 *Referral System*\n\n🔗 Your link:\n`https://t.me/{me.username}?start=ref_{code}`\n\n"
+            f"💰 Balance: ₹{get_balance(uid)}\n👥 Referred: {len(r.get('referred', []))}\n📈 Earnings: ₹{r.get('earnings', 0)}\n\n"
+            f"_When someone you referred buys a plan, you get 20% of the price in your balance._",
+            parse_mode='Markdown', reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data='back_start')]]))
+    elif d == 'ref_buy_menu':
+        kb = [[InlineKeyboardButton(f"{p['name']} — ₹{p['price']} ({p['days']}d)", callback_data=f"buy_{p['plan_id']}")] for p in load_plans()]
+        kb.append([InlineKeyboardButton("🔙 Back", callback_data='back_start')])
+        await q.edit_message_text(f"💰 Your balance: ₹{get_balance(uid)}\nChoose a plan:", parse_mode='Markdown', reply_markup=InlineKeyboardMarkup(kb))
+    # ---- v7 owner payment review ----
+    elif d.startswith('payok_'):
+        if not is_owner(uid): return
+        _, buyer_s, pid = d.split('_', 2)
+        buyer = int(buyer_s)
+        plan = next((p for p in load_plans() if p['plan_id'] == pid), None)
+        if not plan:
+            await q.edit_message_text("❌ Plan gone"); return
+        await activate_plan(buyer, int(plan['days']), plan['name'])
+        comm_msg = ""
+        ref = get_referrer_of(buyer)
+        if ref:
+            comm = round(float(plan['price']) * 0.20, 2)
+            add_balance(ref, comm)
+            r = load_json(REFS_FILE, {}); r[str(ref)]['earnings'] = r[str(ref)].get('earnings', 0) + comm; save_json(REFS_FILE, r)
+            nm = load_names().get(str(buyer), {}).get('name', str(buyer))
+            try: await c.bot.send_message(ref, f"💰 You referred {nm}.\nThey bought '{plan['name']}' for ₹{plan['price']}.\n✅ 20% (₹{comm}) added to your balance.")
+            except: pass
+            comm_msg = f"\n👥 Referral commission ₹{comm} → ID {ref}"
+        try: await q.edit_message_text(f"✅ Accepted payment of {buyer} ({plan['name']}){comm_msg}")
+        except: pass
+    elif d.startswith('payno_'):
+        if not is_owner(uid): return
+        buyer = int(d.split('_')[1])
+        try: await c.bot.send_message(buyer, "❌ Your payment was rejected. Contact admin 👉 @G18GamerBacko")
+        except: pass
+        await q.edit_message_text("❌ Rejected & user notified")
+    elif d.startswith('payblock_'):
+        if not is_owner(uid): return
+        buyer = int(d.split('_')[1])
+        try: await c.bot.send_message(buyer, "🚫 You have been blocked for fake payment.")
+        except: pass
+        bl = load_json(BLOCKED_FILE, [])
+        if buyer not in bl: bl.append(buyer); save_json(BLOCKED_FILE, bl)
+        await q.edit_message_text("🚫 User blocked")
+
+    elif d == 'start_all':
         p = []
         for a in get_all_accounts(uid):
             if account_stats.get(a['id'],{}).get('running',False): p.append(f"✅ Already running: {get_display_name(a)}")
@@ -722,8 +933,6 @@ async def button_click(u, c):
         mn, mx, cyc = speed_for(uid); c.user_data['awaiting'] = 'set_max'
         await q.edit_message_text(f"⏱️ Enter Max seconds (> {mn}):", reply_markup=BACK_KB)
     elif d == 'set_cycle': c.user_data['awaiting'] = 'set_cycle'; await q.edit_message_text("🔄 Enter cycle seconds (5+):", reply_markup=BACK_KB)
-
-    # ---- Special message feature ----
     elif d == 'special_msg_menu':
         accs = get_all_accounts(uid)
         if not accs: await q.edit_message_text("❌ No accounts", reply_markup=BACK_KB); return
@@ -761,8 +970,6 @@ async def button_click(u, c):
             await q.edit_message_text("⛔ Not your account", reply_markup=BACK_KB); return
         set_special_msg(aid, "")
         await q.edit_message_text("🗑️ Special message removed — এই id আবার সাধারণ random spam করবে।", reply_markup=BACK_KB)
-
-    # ---- Profile setup ----
     elif d == 'profile_setup':
         accs = get_all_accounts(uid); cfg = get_default_profile(); nm = cfg.get('names',[]); ph = cfg.get('photos',[])
         if not accs: await q.edit_message_text("❌ No accounts", reply_markup=BACK_KB); return
@@ -832,7 +1039,8 @@ async def button_click(u, c):
         if not is_owner(uid): return
         kb = [[InlineKeyboardButton("➕ Add / Edit Admin", callback_data='add_admin'),
                InlineKeyboardButton("📋 Admin List", callback_data='admin_list')],
-              [InlineKeyboardButton("🔢 Set Account Limit", callback_data='set_admin_limit')],
+              [InlineKeyboardButton("🔢 Set Account Limit", callback_data='set_admin_limit'),
+               InlineKeyboardButton("💰 Plans & QR", callback_data='plans_menu')],
               [InlineKeyboardButton(f"👻 Start-msg: {'ON' if SHOW_START_TO_OTHERS else 'OFF'}", callback_data='toggle_startmsg')],
               [InlineKeyboardButton("📢 Broadcast", callback_data='broadcast_menu')],
               [InlineKeyboardButton("🔙 Back", callback_data='back_main')]]
@@ -885,10 +1093,40 @@ async def button_click(u, c):
             accs = get_all_accounts(a['user_id'])
             cap = a.get('max_accounts'); cap_str = f"🔢 Accounts: {len(accs)}" if not cap else f"🔢 Accounts: {len(accs)}/{cap}"
             txt += f"👤 {admin_label(a['user_id'])}\n ⏳ {remaining_time_str(a.get('expires_at'))}\n {cap_str}\n\n"
-            kb.append([InlineKeyboardButton(f"🕐 Edit · {get_names_short(a['user_id'])} ({a['user_id']})", callback_data=f'admin_edit_{a["user_id"]}')])
-            kb.append([InlineKeyboardButton(f"🗑️ Delete · {get_names_short(a['user_id'])} ({a['user_id']})", callback_data=f'del_admin_{a["user_id"]}')])
+            kb.append([InlineKeyboardButton(f"🕐 Edit · {get_names_short(a['user_id'])} ({a['user_id']})", callback_data=f'admin_edit_{a["user_id"]}'),
+                       InlineKeyboardButton(f"🗑️", callback_data=f'del_admin_{a["user_id"]}')])
         kb.append([InlineKeyboardButton("🔙 Back", callback_data='admin_panel')])
         await q.edit_message_text(txt, parse_mode='Markdown', reply_markup=InlineKeyboardMarkup(kb))
+    elif d == 'plans_menu':
+        if not is_owner(uid): return
+        plans = load_plans(); qr = load_qr()
+        txt = "💰 *Plans*\n" + "".join(f"\n▫️ {p['name']} | ₹{p['price']} | {p['days']}d | 🖲 {p['btn_name']}" for p in plans)
+        txt += f"\n\n🖼️ QR: {'✅ set' if qr.get('photo') else '❌ not set'}"
+        kb = [[InlineKeyboardButton("➕ Add Plan", callback_data='plan_add'),
+               InlineKeyboardButton("🗑️ Del Plan", callback_data='plan_del')],
+              [InlineKeyboardButton("🖼️ Set QR Photo", callback_data='qr_set')],
+              [InlineKeyboardButton("🔙 Back", callback_data='admin_panel')]]
+        await q.edit_message_text(txt, parse_mode='Markdown', reply_markup=InlineKeyboardMarkup(kb))
+    elif d == 'plan_add':
+        if not is_owner(uid): return
+        c.user_data['awaiting'] = 'plan_add'
+        await q.edit_message_text("➕ Send plan in this format:\n`Button Name | Plan Name | PRICE | DAYS`\nExample:\n`Buy 30 Days 🔥 | 30 Days Access | 150 | 30`", parse_mode='Markdown', reply_markup=BACK_KB)
+    elif d == 'plan_del':
+        if not is_owner(uid): return
+        plans = load_plans()
+        if not plans: await q.edit_message_text("❌ No plans", reply_markup=BACK_KB); return
+        kb = [[InlineKeyboardButton(f"🗑️ {p['name']}", callback_data=f'plan_del_{p["plan_id"]}')] for p in plans]
+        kb.append([InlineKeyboardButton("🔙 Back", callback_data='plans_menu')])
+        await q.edit_message_text("Which plan?", reply_markup=InlineKeyboardMarkup(kb))
+    elif d.startswith('plan_del_'):
+        if not is_owner(uid): return
+        pid = d.replace('plan_del_', '')
+        save_plans([p for p in load_plans() if p['plan_id'] != pid])
+        await q.edit_message_text("🗑️ Deleted", reply_markup=BACK_KB)
+    elif d == 'qr_set':
+        if not is_owner(uid): return
+        c.user_data['awaiting'] = 'qr_set'
+        await q.edit_message_text("🖼️ Send the payment QR photo:", reply_markup=BACK_KB)
     elif d.startswith('admin_edit_'):
         if not is_owner(uid): return
         t = int(d.replace('admin_edit_',''))
@@ -978,16 +1216,37 @@ async def button_click(u, c):
         refresh_account_stats(uid); preload_display_names(get_all_accounts(uid))
         await q.edit_message_text(main_menu_text(uid), parse_mode='Markdown', reply_markup=main_menu_keyboard(uid))
 
-def get_names_short(uid):
-    info = load_names().get(str(uid))
-    if info and info.get('name'):
-        return info['name'][:14]
-    return str(uid)
-
 async def handle_photo(u, c):
     uid = u.effective_user.id
     eu = u.effective_user
     record_user_info(uid, eu.first_name, eu.last_name, eu.username)
+
+    # ---- v7: payment screenshot (works for ANY user, incl. expired) ----
+    if c.user_data.get('awaiting') == 'pay_screenshot' and u.message.photo:
+        pid = c.user_data.pop('pay_plan', None); c.user_data['awaiting'] = None
+        if not pid:
+            await u.message.reply_text("❌ Session reset. Choose a plan again.", reply_markup=expired_panel_keyboard()); return
+        plan = next((p for p in load_plans() if p['plan_id'] == pid), None)
+        nm = load_names().get(str(uid), {}).get('name', str(uid))
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("✅ Accept", callback_data=f'payok_{uid}_{pid}'),
+             InlineKeyboardButton("❌ Reject", callback_data=f'payno_{uid}')],
+            [InlineKeyboardButton("🚫 Block User", callback_data=f'payblock_{uid}')]])
+        try:
+            await c.bot.send_photo(OWNER_ID, photo=u.message.photo[-1].file_id,
+                caption=f"💳 *Payment from:* {nm} (ID: {uid})\n💎 Plan: {plan['name'] if plan else pid} — ₹{plan['price'] if plan else '?'}",
+                parse_mode='Markdown', reply_markup=kb)
+            await u.message.reply_text("✅ Sent to admin! Please wait for confirmation.", reply_markup=expired_panel_keyboard())
+        except Exception as e:
+            await u.message.reply_text(f"❌ {str(e)[:100]}")
+        return
+
+    # ---- v7: QR photo set (owner) ----
+    if c.user_data.get('awaiting') == 'qr_set' and is_owner(uid) and u.message.photo:
+        qr = load_qr(); qr['photo'] = u.message.photo[-1].file_id; save_qr(qr)
+        c.user_data['awaiting'] = None
+        await u.message.reply_text("✅ QR saved!", reply_markup=BACK_KB); return
+
     if not (is_owner(uid) or is_valid_admin(uid)): return
     if c.user_data.get('awaiting') == 'def_add_photo':
         cfg = get_default_profile(); ph = cfg.get('photos',[]); ph.append(u.message.photo[-1].file_id)
@@ -1007,8 +1266,12 @@ async def handle_text(u, c):
     uid = u.effective_user.id
     eu = u.effective_user
     record_user_info(uid, eu.first_name, eu.last_name, eu.username)
-    if not (is_owner(uid) or is_valid_admin(uid)): return
-    text = u.message.text.strip(); aw = c.user_data.get('awaiting')
+    text = u.message.text.strip()
+    aw = c.user_data.get('awaiting')
+
+    # ---- v7: allow expired users only for pay_screenshot prompt ----
+    FREE_STATES = ('pay_screenshot',)
+    if not (is_owner(uid) or is_valid_admin(uid)) and aw not in FREE_STATES: return
 
     # ---- Single-user broadcast target ----
     if aw == 'broadcast_target' and is_owner(uid):
@@ -1024,6 +1287,22 @@ async def handle_text(u, c):
         tid = c.user_data.pop('bc_uid', None)
         await do_broadcast(u.message, c.bot, uid, text, only_user_id=tid)
         return
+
+    # ---- v7: user sent text instead of screenshot ----
+    if aw == 'pay_screenshot':
+        c.user_data['awaiting'] = None
+        await u.message.reply_text("📸 Please send a PHOTO (screenshot), not text.", reply_markup=expired_panel_keyboard()); return
+
+    # ---- v7: plan add (owner) ----
+    if aw == 'plan_add' and is_owner(uid):
+        c.user_data['awaiting'] = None
+        parts = [x.strip() for x in text.split('|')]
+        if len(parts) != 4:
+            await u.message.reply_text("❌ Format: `Button | Name | Price | Days`", parse_mode='Markdown', reply_markup=BACK_KB); return
+        plans = load_plans()
+        plans.append({'plan_id': uuid.uuid4().hex[:6], 'btn_name': parts[0], 'name': parts[1], 'price': float(parts[2]), 'days': int(parts[3])})
+        save_plans(plans)
+        await u.message.reply_text("✅ Plan added!", reply_markup=BACK_KB); return
 
     # ---- Custom admin time (typed) ----
     if aw == 'adm_custom_time':
@@ -1068,7 +1347,8 @@ async def handle_text(u, c):
         c.user_data['awaiting'] = None
         if not is_owner(uid): return
         try:
-            p = text.split(); t = int(p[0]); cap = int(p[1]); cap < 0 and (_ for _ in () ).throw(ValueError())
+            p = text.split(); t = int(p[0]); cap = int(p[1])
+            if cap < 0: raise ValueError()
         except Exception:
             await u.message.reply_text("❌ `USER_ID NUMBER`", reply_markup=BACK_KB); return
         admins = load_admins(); found = False
@@ -1134,7 +1414,7 @@ async def handle_text(u, c):
             except: pass
         return
 
-    # ===== OTP CODE (FIXED — single sign_in, no auto-resend, clean reset) =====
+    # ===== OTP CODE (single sign_in, no auto-resend, clean reset) =====
     if aw == 'otp_code':
         lid = c.user_data.get('login_id'); st = phone_login_states.get(lid) if lid else None
         if not st:
@@ -1144,7 +1424,6 @@ async def handle_text(u, c):
         if not code.isdigit():
             await u.message.reply_text("❌ digits only", reply_markup=BACK_KB); return
         client = st.get('client')
-        # client মারা গেলে ফের reconnect (নতুন code request নয়)
         try:
             if not client or not client.is_connected():
                 client = TelegramClient(StringSession(), st['api_id'], st['api_hash'], receive_updates=False)
@@ -1164,7 +1443,6 @@ async def handle_text(u, c):
             except: pass
             return
         except PhoneCodeExpiredError:
-            # auto-resend নেই — পুরো flow reset
             try: await client.disconnect()
             except: pass
             phone_login_states.pop(lid, None); c.user_data.pop('login_id', None); c.user_data['awaiting'] = None
@@ -1183,7 +1461,6 @@ async def handle_text(u, c):
             try: await u.message.reply_text(f"❌ {str(e)[:150]}", reply_markup=BACK_KB)
             except: pass
             return
-        # ---- সফল: একই client থেকে session (২য় sign_in নেই) ----
         try:
             me = await client.get_me(); fresh = client.session.save(); await client.disconnect()
         except Exception as e:
