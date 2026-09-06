@@ -2,7 +2,7 @@
 """
 Telegram Mass Messaging Bot v1.1 FINAL (CLEAN MERGE, referral removed, OTP markdown-safe)
 - Per-account SPECIAL MESSAGE
-- Phone OTP login (single sign_in, no auto-resend loop) - Markdown-safe now
+- Phone OTP login (single sign_in, no auto-resend loop) - Markdown-safe
 - Auto-remove expired admins + 20s pre-expiry warning
 - Owner custom admin time (+ add / - subtract / = set), 1s..any
 - Targeted broadcast to a single user with error reporting
@@ -730,7 +730,7 @@ async def button_click(u, c):
         if not plan:
             await q.edit_message_text("❌ Plan unavailable", reply_markup=expired_panel_keyboard()); return
         kb = [[InlineKeyboardButton("✅ I Have Paid", callback_data=f'paid_{pid}'),
-              [InlineKeyboardButton("🔙 Back", callback_data='back_start')]]
+               InlineKeyboardButton("🔙 Back", callback_data='back_start')]]
         cap = f"\n\n💎 {plan['name']}\n💸 Price: ₹{plan['price']}\n⏳ Duration: {plan['days']} days"
         qr = load_qr()
         try: await q.message.delete()
@@ -1282,7 +1282,7 @@ async def handle_text(u, c):
             set_speed(uid, cycle=v)
         await u.message.reply_text(f"✅ Speed updated: {speed_for(uid)}", reply_markup=BACK_KB); return
 
-    # ================= PHONE LOGIN (MARKDOWN-SAFE: plain text only) =================
+    # =============== PHONE LOGIN (MARKDOWN-SAFE: plain text only) ===============
     if aw == 'phone_number':
         c.user_data['awaiting'] = None
         try:
@@ -1308,7 +1308,7 @@ async def handle_text(u, c):
                 phone_login_states[lid] = {'phone': ph, 'owner_id': uid, 'client': client,
                                            'phone_code_hash': sent.phone_code_hash, 'tries': 0}
                 c.user_data['awaiting'] = 'otp_code'; c.user_data['login_id'] = lid
-                # PLAIN TEXT (no Markdown) so phone/input can't break entity parsing
+                # PLAIN TEXT (no Markdown) so input can't break entity parsing
                 try:
                     await sm.edit_text(f"✉️ OTP sent to {ph}\n\nTelegram app e code ashbe. "
                                        f"Code expire hole abar Phone Login chapo.", reply_markup=BACK_KB)
@@ -1403,13 +1403,12 @@ async def handle_text(u, c):
     if is_owner(uid) or is_valid_admin(uid):
         await u.message.reply_text("Menu theke option bacho 👆", reply_markup=main_menu_keyboard(uid))
 
-# ================= PHONE LOGIN SUCCESS (plain text, no Markdown) =================
+# =============== PHONE LOGIN SUCCESS (plain text, no Markdown) ===============
 async def finish_phone_login(u, c, uid, ph, session_str):
     try:
         reached, rm = account_limit_reached(uid)
         if reached:
             await u.message.reply_text(rm, reply_markup=BACK_KB); return
-        # validate + fetch real name before storing
         if not API_ID_1 or not API_HASH_1:
             await u.message.reply_text("❌ API keys missing!", reply_markup=BACK_KB); return
         tmp = TelegramClient(StringSession(session_str), API_ID_1, API_HASH_1, receive_updates=False)
