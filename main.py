@@ -1,13 +1,16 @@
 #!/usr/bin/env python3
 """
-Telegram Mass Messaging Bot v7.1 FINAL ✨
-- v6.4 features (special msg per account, phone OTP fix, targeted broadcast)
-- v7: 20s pre-expiry warning + auto-remove expired admins
-- v7: Expired user → "bot deleted" screen with PLAN buttons (owner-customizable)
-- v7: QR payment flow → screenshot → owner Accept/Reject/Block
-- v7: Referral system (20% commission, balance-based purchase) — admins & owner can use
-- v7.1: Owner referral overview (who referred whom + names + plan validity)
-- v7.1: Single-user broadcast fixed (clear error if user never /start-ed)
+Telegram Mass Messaging Bot v1.0 FINAL ✨
+- Per-account SPECIAL MESSAGE (only that id spams the pinned msg; others normal)
+- FIXED: Phone OTP loop — single sign_in, NO auto-resend, clean reset on expired code
+- Auto-remove EXPIRED admins from list + notify them (+ 20s pre-expiry warning)
+- Owner can type CUSTOM admin time (1s .. any) in Admin List → ✍️ Custom Time
+- Targeted broadcast to a SINGLE user (by USER_ID) with clear error reporting
+- Expired/new users see 💎 Available Plans buy panel (owner-customizable + QR)
+- QR payment flow → screenshot → owner Accept/Reject/Block
+- Referral system: counts ONLY when referred user BUYS (pending → confirmed on purchase)
+  20% commission credited at purchase time; /start alone never counts
+- Owner referral overview (who referred whom + names + plan validity)
 """
 import sys, os, asyncio, random, logging, json, threading, httpx, re, uuid
 from datetime import datetime, timedelta
@@ -53,7 +56,7 @@ running_tasks, stop_flags, account_clients, account_stats, phone_login_states, d
 data_file = "bot_data.json"
 SHOW_START_TO_OTHERS = True
 
-# ================= v7 STORE / PAYMENT / REFERRAL =================
+# ================= STORE / PAYMENT / REFERRAL =================
 PLANS_FILE = "plans.json"
 REFS_FILE = "referrals.json"
 QR_FILE = "qr_config.json"
@@ -101,12 +104,30 @@ def set_referred(user_id, referrer_id):
     if user_id not in v.setdefault('referred', []):
         v['referred'].append(user_id); save_json(REFS_FILE, r)
 
+def set_pending_ref(user_id, referrer_id):
+    """Referral click = pending only. Counts only when user buys."""
+    if user_id == referrer_id: return
+    if get_referrer_of(user_id) is not None: return
+    r = load_json(REFS_FILE, {})
+    get_ref_code(user_id); get_ref_code(referrer_id)
+    r[str(user_id)]['pending_ref'] = referrer_id
+    save_json(REFS_FILE, r)
+
+def get_pending_ref(user_id):
+    r = load_json(REFS_FILE, {})
+    return r.get(str(user_id), {}).get('pending_ref')
+
+def clear_pending_ref(user_id):
+    r = load_json(REFS_FILE, {})
+    if str(user_id) in r:
+        r[str(user_id)].pop('pending_ref', None); save_json(REFS_FILE, r)
+
 def user_plan_time_str(uid):
     a = get_admin(uid)
     if not a: return "❌ no plan"
     return remaining_time_str(a.get('expires_at'))
 
-async def activate_plan(user_id, days, plan_name="plan"):
+async def activate_plan(user_id, days, plan_name="plan", price=0.0):
     nd = datetime.now() + timedelta(days=days)
     admins = load_admins(); a = get_admin(user_id)
     if a is None:
@@ -127,6 +148,20 @@ async def activate_plan(user_id, days, plan_name="plan"):
     try:
         await notify_user(user_id, f"✅ *Payment confirmed!*\n\n💎 Plan: {plan_name}\n⏳ Your validity: {remaining_time_str(gg.get('expires_at') if gg else None)}")
     except: pass
+    # referral count + commission ONLY on purchase
+    rid = get_pending_ref(user_id)
+    if rid is not None and rid != user_id and price > 0:
+        set_referred(user_id, rid)
+        clear_pending_ref(user_id)
+        comm = round(float(price) * 0.20, 2)
+        add_balance(rid, comm)
+        r = load_json(REFS_FILE, {})
+        if str(rid) in r:
+            r[str(rid)]['earnings'] = r[str(rid)].get('earnings', 0) + comm
+            save_json(REFS_FILE, r)
+        unm = load_names().get(str(user_id), {}).get('name', str(user_id))
+        try: await notify_user(rid, f"💰 You referred {unm} (ID: {user_id}).\nThey bought '{plan_name}' for ₹{price}.\n✅ 20% (₹{comm}) added to your balance.")
+        except: pass
 
 def expired_panel_keyboard():
     kb = []
@@ -419,7 +454,7 @@ def home():
     all_a = get_all_accounts()
     run = sum(1 for a in all_a if account_stats.get(a['id'],{}).get('running',False))
     sent = sum(account_stats.get(a['id'],{}).get('sent',0) for a in all_a)
-    return f"v7.1 FINAL ✨ | Accounts:{len(all_a)} | Active:{run}/{len(all_a)} | Sent:{sent} | Admins:{len(load_admins())}"
+    return f"v1.0 FINAL ✨ | Accounts:{len(all_a)} | Active:{run}/{len(all_a)} | Sent:{sent} | Admins:{len(load_admins())}"
 @web_app.route("/health")
 def health(): return "OK", 200
 def run_flask(): web_app.run(host="0.0.0.0", port=int(os.environ.get("PORT",10000)), debug=False, use_reloader=False)
@@ -601,7 +636,7 @@ def stop_accounts_of(u):
 def stop_all_accounts():
     for a in get_all_accounts(): stop_account(a['id'])
 
-# ================= v7 EXPIRY CHECKER (20s warning + auto-remove) =================
+# ================= EXPIRY CHECKER (20s warning + auto-remove) =================
 async def admin_expiry_checker():
     while True:
         try:
@@ -688,7 +723,7 @@ def main_menu_text(u):
         lim = f"\n🔢 Accounts: {cur}" if cap is None else f"\n🔢 Accounts: {cur}/{cap}"
         extra = exp + lim
     bal = f"\n💰 Balance: ₹{get_balance(u)}"
-    return (f"✨ *Bot v7.1 FINAL* ✨\n{role}{extra}{bal}\n\n"
+    return (f"✨ *Bot v1.0 FINAL* ✨\n{role}{extra}{bal}\n\n"
             f"📊 Accounts: {len(accs)} (Running: {run})\n"
             f"⚡ Speed: {mn}-{mx}s | 🔄 Cycle: {cyc}s\n📨 Sent: {sent}")
 
@@ -696,23 +731,19 @@ async def start_command(u, c):
     uid = u.effective_user.id
     eu = u.effective_user
     record_user_info(uid, eu.first_name, eu.last_name, eu.username)
-    # ---- v7: referral deep link ----
+    # ---- referral deep link → PENDING only (counts on purchase) ----
     args = u.message.text.split(maxsplit=1)
     if len(args) > 1 and args[1].startswith('ref_'):
         rid = find_referrer_by_code(args[1][4:])
-        if rid and rid != uid and get_referrer_of(uid) is None:
-            set_referred(uid, rid)
-            rn = load_names().get(str(uid), {}).get('name', str(uid))
-            try:
-                await c.bot.send_message(rid, f"👥 New referral joined: {rn} (ID: {uid})")
-            except: pass
+        if rid and rid != uid and get_referrer_of(uid) is None and get_pending_ref(uid) is None:
+            set_pending_ref(uid, rid)
     if is_blocked(uid):
         await u.message.reply_text("🚫 You are blocked. Contact admin 👉 @G18GamerBacko"); return
     if is_owner(uid) or is_valid_admin(uid):
         refresh_account_stats(uid); preload_display_names(get_all_accounts(uid))
         await u.message.reply_text(main_menu_text(uid), parse_mode='Markdown', reply_markup=main_menu_keyboard(uid))
         return
-    # ---- v7: expired / normal user panel ----
+    # ---- expired / normal user buy panel ----
     await u.message.reply_text(expired_panel_text(), parse_mode='Markdown', reply_markup=expired_panel_keyboard())
 
 async def apply_admin_time(target, op, nd, q=None, text_ui=None):
@@ -791,16 +822,15 @@ async def button_click(u, c):
     record_user_info(uid, frm.first_name, frm.last_name, frm.username)
     d = q.data
 
-    # ---- v7: free callbacks available to everyone (incl. expired users) ----
-    ALLOWED_FREE_PREFIXES = ('buy_', 'paid_', 'refbuy_', 'back_start', 'ref_menu', 'ref_buy_menu')
-    ALLOWED_FREE_PREFIXES_OWNER_ONLY = ('payok_', 'payno_', 'payblock_')
-    is_free = any(d.startswith(x) for x in ALLOWED_FREE_PREFIXES) or any(d.startswith(x) for x in ALLOWED_FREE_PREFIXES_OWNER_ONLY)
+    # ---- free callbacks available to everyone (incl. expired users) ----
+    ALLOWED_FREE_PREFIXES = ('buy_', 'paid_', 'refbuy_', 'back_start', 'ref_menu', 'ref_buy_menu', 'payok_', 'payno_', 'payblock_')
+    is_free = any(d.startswith(x) for x in ALLOWED_FREE_PREFIXES)
     if not (is_owner(uid) or is_valid_admin(uid)) and not is_free:
         if SHOW_START_TO_OTHERS: await q.edit_message_text("⛔ Access denied / expired.")
         else: await q.edit_message_text(" ")
         return
 
-    # ================= v7 BUY FLOW =================
+    # ================= BUY FLOW =================
     if d.startswith('buy_'):
         pid = d.replace('buy_', '')
         plan = next((p for p in load_plans() if p['plan_id'] == pid), None)
@@ -841,15 +871,7 @@ async def button_click(u, c):
         if not plan or get_balance(uid) < float(plan['price']):
             await q.edit_message_text("❌ Insufficient balance", reply_markup=expired_panel_keyboard()); return
         add_balance(uid, -float(plan['price']))
-        await activate_plan(uid, int(plan['days']), plan['name'])
-        ref = get_referrer_of(uid)
-        if ref:
-            comm = round(float(plan['price']) * 0.20, 2)
-            add_balance(ref, comm)
-            r = load_json(REFS_FILE, {}); r[str(ref)]['earnings'] = r[str(ref)].get('earnings', 0) + comm; save_json(REFS_FILE, r)
-            nm = load_names().get(str(uid), {}).get('name', str(uid))
-            try: await c.bot.send_message(ref, f"💰 You referred {nm}.\nThey bought '{plan['name']}' for ₹{plan['price']}.\n✅ 20% (₹{comm}) added to your balance.")
-            except: pass
+        await activate_plan(uid, int(plan['days']), plan['name'], price=float(plan['price']))
         try: await q.edit_message_text("✅ Plan activated with balance!", reply_markup=expired_panel_keyboard())
         except: pass
     elif d == 'ref_menu':
@@ -858,14 +880,14 @@ async def button_click(u, c):
         r = load_json(REFS_FILE, {}).get(str(uid), {})
         await q.edit_message_text(
             f"👥 *Referral System*\n\n🔗 Your link:\n`https://t.me/{me.username}?start=ref_{code}`\n\n"
-            f"💰 Balance: ₹{get_balance(uid)}\n👥 Referred: {len(r.get('referred', []))}\n📈 Earnings: ₹{r.get('earnings', 0)}\n\n"
+            f"💰 Balance: ₹{get_balance(uid)}\n👥 Referred (bought): {len(r.get('referred', []))}\n📈 Earnings: ₹{r.get('earnings', 0)}\n\n"
             f"_When someone you referred buys a plan, you get 20% of the price in your balance._",
             parse_mode='Markdown', reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data='back_start')]]))
     elif d == 'ref_buy_menu':
         kb = [[InlineKeyboardButton(f"{p['name']} — ₹{p['price']} ({p['days']}d)", callback_data=f"buy_{p['plan_id']}")] for p in load_plans()]
         kb.append([InlineKeyboardButton("🔙 Back", callback_data='back_start')])
         await q.edit_message_text(f"💰 Your balance: ₹{get_balance(uid)}\nChoose a plan:", parse_mode='Markdown', reply_markup=InlineKeyboardMarkup(kb))
-    # ---- v7 owner payment review ----
+    # ---- owner payment review ----
     elif d.startswith('payok_'):
         if not is_owner(uid): return
         _, buyer_s, pid = d.split('_', 2)
@@ -873,18 +895,8 @@ async def button_click(u, c):
         plan = next((p for p in load_plans() if p['plan_id'] == pid), None)
         if not plan:
             await q.edit_message_text("❌ Plan gone"); return
-        await activate_plan(buyer, int(plan['days']), plan['name'])
-        comm_msg = ""
-        ref = get_referrer_of(buyer)
-        if ref:
-            comm = round(float(plan['price']) * 0.20, 2)
-            add_balance(ref, comm)
-            r = load_json(REFS_FILE, {}); r[str(ref)]['earnings'] = r[str(ref)].get('earnings', 0) + comm; save_json(REFS_FILE, r)
-            nm = load_names().get(str(buyer), {}).get('name', str(buyer))
-            try: await c.bot.send_message(ref, f"💰 You referred {nm}.\nThey bought '{plan['name']}' for ₹{plan['price']}.\n✅ 20% (₹{comm}) added to your balance.")
-            except: pass
-            comm_msg = f"\n👥 Referral commission ₹{comm} → ID {ref}"
-        try: await q.edit_message_text(f"✅ Accepted payment of {buyer} ({plan['name']}){comm_msg}")
+        await activate_plan(buyer, int(plan['days']), plan['name'], price=float(plan['price']))
+        try: await q.edit_message_text(f"✅ Accepted payment of {buyer} ({plan['name']})")
         except: pass
     elif d.startswith('payno_'):
         if not is_owner(uid): return
@@ -1082,21 +1094,18 @@ async def button_click(u, c):
         refs = load_json(REFS_FILE, {})
         lines = ["👥 *Referral Overview*\n"]
         total_comm = 0.0
-        any_ref = False
         for rid_s, v in refs.items():
             rid = int(rid_s)
             referred = v.get('referred', [])
             earn = v.get('earnings', 0); total_comm += earn
-            bal = get_balance(rid)
             lines.append(f"\n🔗 *Referrer:* {admin_label(rid)}")
-            lines.append(f"   💰 Balance: ₹{bal} | 📈 Earned: ₹{earn}")
+            lines.append(f"   💰 Balance: ₹{get_balance(rid)} | 📈 Earned: ₹{earn}")
             if referred:
-                any_ref = True
                 for ruid in referred:
                     rnm = load_names().get(str(ruid), {}).get('name', str(ruid))
                     lines.append(f"   ↳ 👤 {rnm} (ID: {ruid}) | ⏳ {user_plan_time_str(ruid)}")
             else:
-                lines.append("   ↳ _no referrals yet_")
+                lines.append("   ↳ _no confirmed referrals yet_")
         if not refs:
             lines.append("_No referral data yet._")
         lines.append(f"\n📊 Total commission paid: ₹{round(total_comm, 2)}")
@@ -1280,7 +1289,7 @@ async def handle_photo(u, c):
     eu = u.effective_user
     record_user_info(uid, eu.first_name, eu.last_name, eu.username)
 
-    # ---- v7: payment screenshot (works for ANY user, incl. expired) ----
+    # ---- payment screenshot (works for ANY user, incl. expired) ----
     if c.user_data.get('awaiting') == 'pay_screenshot' and u.message.photo:
         pid = c.user_data.pop('pay_plan', None); c.user_data['awaiting'] = None
         if not pid:
@@ -1300,7 +1309,7 @@ async def handle_photo(u, c):
             await u.message.reply_text(f"❌ {str(e)[:100]}")
         return
 
-    # ---- v7: QR photo set (owner) ----
+    # ---- QR photo set (owner) ----
     if c.user_data.get('awaiting') == 'qr_set' and is_owner(uid) and u.message.photo:
         qr = load_qr(); qr['photo'] = u.message.photo[-1].file_id; save_qr(qr)
         c.user_data['awaiting'] = None
@@ -1331,7 +1340,7 @@ async def handle_text(u, c):
     text = u.message.text.strip()
     aw = c.user_data.get('awaiting')
 
-    # ---- v7: allow expired users only for pay_screenshot prompt ----
+    # allow expired users only for pay_screenshot prompt
     FREE_STATES = ('pay_screenshot',)
     if not (is_owner(uid) or is_valid_admin(uid)) and aw not in FREE_STATES: return
 
@@ -1355,12 +1364,12 @@ async def handle_text(u, c):
         await do_broadcast(u.message, c.bot, uid, text, only_user_id=tid)
         return
 
-    # ---- v7: user sent text instead of screenshot ----
+    # ---- user sent text instead of screenshot ----
     if aw == 'pay_screenshot':
         c.user_data['awaiting'] = None
         await u.message.reply_text("📸 Please send a PHOTO (screenshot), not text.", reply_markup=expired_panel_keyboard()); return
 
-    # ---- v7: plan add (owner) ----
+    # ---- plan add (owner) ----
     if aw == 'plan_add' and is_owner(uid):
         c.user_data['awaiting'] = None
         parts = [x.strip() for x in text.split('|')]
