@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
-Telegram Mass Messaging Bot v6.3
-- Admin add/edit supports combined SECONDS/MINUTES/HOURS/DAYS/WEEKS (e.g. 111 +2d 5h 30m)
-- Phone Login and Session Login are SEPARATE ROWS (upar-niche)
-- Admin NAME shown with ID in list / add / delete / edit (auto-captured on first contact)
-- English + emoji UI | Status inside Settings | Broadcast inside Admin Panel
-- per-user speed | isolated admin accounts | owner-only admin panel
-- v6.3+: per-account SPECIAL MESSAGE (only that id spams the pinned message; others normal)
+Telegram Mass Messaging Bot v6.4 ✨
+- v6.3+ per-account SPECIAL MESSAGE (only that id spams the pinned msg; others normal)
+- FIXED: Phone OTP double-login loop (single sign_in, no repeated resend)
+- Auto-remove EXPIRED admins from list + notify them
+- Owner can type CUSTOM admin time (1s .. any) in Admin List → ✍️ Custom Time
+- Targeted broadcast to a SINGLE user (by USER_ID)
+- Premium styled emoji UI
 """
 import sys, os, asyncio, random, logging, json, threading, httpx, re, uuid
 from datetime import datetime, timedelta
@@ -46,12 +46,12 @@ MESSAGE = os.environ.get("MESSAGE", "𝟭𝟬 𝗠𝗜𝗡 𝗩𝗖")
 MIN_INTERVAL = int(os.environ.get("MIN_INTERVAL", "6"))
 MAX_INTERVAL = int(os.environ.get("MAX_INTERVAL", "10"))
 CYCLE_WAIT = int(os.environ.get("CYCLE_WAIT", "45"))
+EXPIRED_MSG = "Your plan has expired. Contact admin 👉 @G18GamerBacko to buy a new one."
 
 running_tasks, stop_flags, account_clients, account_stats, phone_login_states, display_names = {}, {}, {}, {}, {}, {}
 data_file = "bot_data.json"
 SHOW_START_TO_OTHERS = True
 
-# ---------------- User name registry (show Name + ID for admins) ----------------
 def load_names():
     try: return json.load(open(NAME_FILE)) if os.path.exists(NAME_FILE) else {}
     except: return {}
@@ -72,7 +72,6 @@ def admin_label(uid):
         return f"{info['name']} (ID: {uid})"
     return f"ID: {uid}"
 
-# ---------------- Per-user speed ----------------
 def load_user_speeds():
     try: return json.load(open(USER_SPEED_FILE)) if os.path.exists(USER_SPEED_FILE) else {}
     except: return {}
@@ -90,7 +89,6 @@ def set_speed(uid, min_i=None, max_i=None, cycle=None):
     if cycle is not None: s['cycle'] = cycle
     save_user_speeds(d)
 
-# ---------------- Per-account special message ----------------
 def load_special_msgs():
     try: return json.load(open(SPECIAL_MSG_FILE)) if os.path.exists(SPECIAL_MSG_FILE) else {}
     except: return {}
@@ -163,7 +161,6 @@ def remaining_time_str(e):
     if m: p.append(f"{m}m")
     return " ".join(p) + " left" if p else "<1s"
 
-# Combined multi-unit duration: '2d 5h 30m', '1w', '45s', etc.
 def parse_duration(t):
     t = t.strip().lower()
     if t in ('perm','permanent','inf','unlimited','infinite'): return None
@@ -327,7 +324,7 @@ def home():
     all_a = get_all_accounts()
     run = sum(1 for a in all_a if account_stats.get(a['id'],{}).get('running',False))
     sent = sum(account_stats.get(a['id'],{}).get('sent',0) for a in all_a)
-    return f"v6.3 | Accounts:{len(all_a)} | Active:{run}/{len(all_a)} | Sent:{sent} | Admins:{len(load_admins())}"
+    return f"v6.4 ✨ | Accounts:{len(all_a)} | Active:{run}/{len(all_a)} | Sent:{sent} | Admins:{len(load_admins())}"
 @web_app.route("/health")
 def health(): return "OK", 200
 def run_flask(): web_app.run(host="0.0.0.0", port=int(os.environ.get("PORT",10000)), debug=False, use_reloader=False)
@@ -514,8 +511,20 @@ async def admin_expiry_checker():
         try:
             await asyncio.sleep(60)
             valid = {OWNER_ID}
-            for a in load_admins():
-                if is_valid_admin(a['user_id']): valid.add(a['user_id'])
+            admins = load_admins(); changed = False; keep = []
+            for a in admins:
+                if is_valid_admin(a['user_id']):
+                    keep.append(a); valid.add(a['user_id'])
+                else:
+                    changed = True
+                    for acc in get_all_accounts(a['user_id']):
+                        if account_stats.get(acc['id'],{}).get('running',False):
+                            stop_account(acc['id'])
+                        await disconnect_client(acc['id'])
+                    try:
+                        await notify_user(a['user_id'], f"⛔ *Plan expired*\n\n{EXPIRED_MSG}")
+                    except: pass
+            if changed: save_admins(keep)
             for acc in get_all_accounts():
                 oid = acc.get('owner_id', OWNER_ID)
                 if oid not in valid and account_stats.get(acc['id'],{}).get('running',False):
@@ -536,7 +545,6 @@ async def test_session_only(ss):
             try: await c.disconnect()
             except: pass
 
-# ---- Keyboards ----
 def main_menu_keyboard(u):
     if is_owner(u):
         return InlineKeyboardMarkup([
@@ -569,9 +577,9 @@ def main_menu_text(u):
         cap = admin_max_accounts(u); cur = owner_acc_count(u)
         lim = f"\n🔢 Accounts: {cur}" if cap is None else f"\n🔢 Accounts: {cur}/{cap}"
         extra = exp + lim
-    return (f"*Bot v6.3*\n{role}{extra}\n\n"
+    return (f"✨ *Bot v6.4* ✨\n{role}{extra}\n\n"
             f"📊 Accounts: {len(accs)} (Running: {run})\n"
-            f"⚡ Speed: {mn}-{mx}s | Cycle: {cyc}s\n📨 Sent: {sent}")
+            f"⚡ Speed: {mn}-{mx}s | 🔄 Cycle: {cyc}s\n📨 Sent: {sent}")
 
 async def start_command(u, c):
     uid = u.effective_user.id
@@ -619,11 +627,11 @@ async def apply_admin_time(target, op, nd, q=None, text_ui=None):
         except: pass
     return resp
 
-async def do_broadcast(reply_target, bot, uid, caption="", media_file=None, media_type="text"):
+async def do_broadcast(reply_target, bot, uid, caption="", media_file=None, media_type="text", only_user_id=None):
     if not is_owner(uid): return
-    targets = broadcast_targets()
+    targets = [only_user_id] if only_user_id is not None else broadcast_targets()
     if not targets:
-        try: await reply_target.reply_text("❌ No admins available", reply_markup=BACK_KB)
+        try: await reply_target.reply_text("❌ No target available", reply_markup=BACK_KB)
         except: pass
         return
     ok = 0
@@ -635,7 +643,9 @@ async def do_broadcast(reply_target, bot, uid, caption="", media_file=None, medi
             else: await bot.send_message(chat_id=t, text=caption)
             ok += 1
         except Exception as e: logger.error(f"bc:{e}")
-    try: await reply_target.reply_text(f"📢 Broadcast sent to {ok}/{len(targets)} admins", reply_markup=BACK_KB)
+    try:
+        who = "single user" if only_user_id is not None else "all admins"
+        await reply_target.reply_text(f"📢 Broadcast sent to {ok} ({who})", reply_markup=BACK_KB)
     except: pass
 
 async def button_click(u, c):
@@ -679,7 +689,7 @@ async def button_click(u, c):
                InlineKeyboardButton("⏱️ Speed", callback_data='edit_speed')],
               [InlineKeyboardButton("📌 Special Msg", callback_data='special_msg_menu')],
               [InlineKeyboardButton("🔙 Back", callback_data='back_main')]]
-        await q.edit_message_text(f"⚙️ *Settings*\n⚡ Speed: {mn}-{mx}s | Cycle: {cyc}s", parse_mode='Markdown',
+        await q.edit_message_text(f"⚙️ *Settings*\n⚡ Speed: {mn}-{mx}s | 🔄 Cycle: {cyc}s", parse_mode='Markdown',
                                   reply_markup=InlineKeyboardMarkup(kb))
     elif d == 'message_list':
         m = load_messages_for(uid); txt = f"📝 *Your Messages* ({len(m)}):\n" + "".join(f"`{x[:40]}`\n\n" for x in m[:10])
@@ -826,11 +836,23 @@ async def button_click(u, c):
               [InlineKeyboardButton(f"👻 Start-msg: {'ON' if SHOW_START_TO_OTHERS else 'OFF'}", callback_data='toggle_startmsg')],
               [InlineKeyboardButton("📢 Broadcast", callback_data='broadcast_menu')],
               [InlineKeyboardButton("🔙 Back", callback_data='back_main')]]
-        await q.edit_message_text("👑 *Admin Panel* _(Owner only)_", parse_mode='Markdown', reply_markup=InlineKeyboardMarkup(kb))
+        await q.edit_message_text("👑 *Admin Panel* ✨ _(Owner only)_", parse_mode='Markdown', reply_markup=InlineKeyboardMarkup(kb))
     elif d == 'broadcast_menu':
         if not is_owner(uid): return
-        c.user_data['awaiting'] = 'broadcast_capture'
-        await q.edit_message_text("📢 *Broadcast*\nNow send text / photo / video — goes to all admins.\nCancel = /cancel",
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("📢 To All Admins", callback_data='bc_all')],
+            [InlineKeyboardButton("👤 To One User", callback_data='bc_one')],
+            [InlineKeyboardButton("🔙 Back", callback_data='admin_panel')]])
+        await q.edit_message_text("📨 *Broadcast*\nChoose target:", parse_mode='Markdown', reply_markup=kb)
+    elif d == 'bc_all':
+        if not is_owner(uid): return
+        c.user_data['awaiting'] = 'broadcast_capture'; c.user_data.pop('bc_uid', None)
+        await q.edit_message_text("📢 Now send text / photo / video — goes to all admins.\nCancel = /cancel",
+                                  parse_mode='Markdown', reply_markup=BACK_KB)
+    elif d == 'bc_one':
+        if not is_owner(uid): return
+        c.user_data['awaiting'] = 'broadcast_target'
+        await q.edit_message_text("👤 Send the target USER_ID (only number):\nCancel = /cancel",
                                   parse_mode='Markdown', reply_markup=BACK_KB)
     elif d == 'set_admin_limit':
         if not is_owner(uid): return
@@ -873,14 +895,25 @@ async def button_click(u, c):
         a = get_admin(t)
         if not a: await q.edit_message_text("❌ Not an admin", reply_markup=BACK_KB); return
         kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("+30 days", callback_data=f'admop_{t}_+30'), InlineKeyboardButton("+100 days", callback_data=f'admop_{t}_+100')],
-            [InlineKeyboardButton("-10 days", callback_data=f'admop_{t}_-10'), InlineKeyboardButton("-30 days", callback_data=f'admop_{t}_-30')],
+            [InlineKeyboardButton("➕30d", callback_data=f'admop_{t}_+30'), InlineKeyboardButton("➕100d", callback_data=f'admop_{t}_+100')],
+            [InlineKeyboardButton("➖10d", callback_data=f'admop_{t}_-10'), InlineKeyboardButton("➖30d", callback_data=f'admop_{t}_-30')],
+            [InlineKeyboardButton("✍️ Custom Time", callback_data=f'adm_time_{t}')],
             [InlineKeyboardButton("♾️ Permanent", callback_data=f'admop_{t}_=perm'), InlineKeyboardButton("⛔ Expire", callback_data=f'admop_{t}_=0')],
             [InlineKeyboardButton("🔙 Back", callback_data='admin_list')]])
         accs = get_all_accounts(t)
         names = "\n".join(f" • {get_display_name(x)}" for x in accs[:10]) or "  _none_"
         await q.edit_message_text(f"👤 {admin_label(t)}\n⏳ {remaining_time_str(a.get('expires_at'))}\n📊 Accounts:\n{names}",
                                   parse_mode='Markdown', reply_markup=kb)
+    elif d.startswith('adm_time_'):
+        if not is_owner(uid): return
+        try: t = int(d.replace('adm_time_',''))
+        except: await q.edit_message_text("❌ Parse error", reply_markup=BACK_KB); return
+        c.user_data['awaiting'] = 'adm_custom_time'; c.user_data['adm_target'] = t
+        await q.edit_message_text(
+            "⏳ *Custom Time (Add)*\n\nSend duration — 1 second থেকে যত খুশি:\n"
+            "🔹 `45s` → 45 sec\n🔹 `30m` → 30 min\n🔹 `2d 5h` → 2d 5h\n🔹 `1d` → 1 day\n🔹 `1w` → 1 week\n"
+            "(`-30m` দিলে subtract)\n\nএখন লিখে পাঠান:",
+            parse_mode='Markdown', reply_markup=BACK_KB)
     elif d.startswith('admop_'):
         if not is_owner(uid): return
         try:
@@ -891,7 +924,6 @@ async def button_click(u, c):
         if op == 'perm': await apply_admin_time(target, '=', None, q=q)
         elif op == '0':
             a = get_admin(target)
-            a['expires_at'] = now.isoformat() if a else None
             if a: a['expires_at'] = now.isoformat(); a['updated_at']=now.isoformat(); replace_admin(target,a)
             await q.edit_message_text(f"⛔ Admin expired: {admin_label(target)}", reply_markup=BACK_KB)
         else:
@@ -962,15 +994,14 @@ async def handle_photo(u, c):
         cfg['photos'] = ph; save_default_profile(cfg); c.user_data['awaiting'] = None
         await u.message.reply_text(f"🖼️ Logo #{len(ph)} saved", reply_markup=BACK_KB); return
     if c.user_data.get('awaiting') == 'broadcast_capture' and is_owner(uid):
+        c.user_data['awaiting'] = None
+        tid = c.user_data.pop('bc_uid', None)
         if u.message.video:
-            c.user_data['awaiting'] = None
-            await do_broadcast(u.message, c.bot, uid, u.message.caption or "", u.message.video.file_id, 'video')
+            await do_broadcast(u.message, c.bot, uid, u.message.caption or "", u.message.video.file_id, 'video', only_user_id=tid)
         elif u.message.photo:
-            c.user_data['awaiting'] = None
-            await do_broadcast(u.message, c.bot, uid, u.message.caption or "", u.message.photo[-1].file_id, 'photo')
+            await do_broadcast(u.message, c.bot, uid, u.message.caption or "", u.message.photo[-1].file_id, 'photo', only_user_id=tid)
         elif u.message.animation:
-            c.user_data['awaiting'] = None
-            await do_broadcast(u.message, c.bot, uid, u.message.caption or "", u.message.animation.file_id, 'animation')
+            await do_broadcast(u.message, c.bot, uid, u.message.caption or "", u.message.animation.file_id, 'animation', only_user_id=tid)
 
 async def handle_text(u, c):
     uid = u.effective_user.id
@@ -979,9 +1010,36 @@ async def handle_text(u, c):
     if not (is_owner(uid) or is_valid_admin(uid)): return
     text = u.message.text.strip(); aw = c.user_data.get('awaiting')
 
+    # ---- Single-user broadcast target ----
+    if aw == 'broadcast_target' and is_owner(uid):
+        try: tid = int(text.strip())
+        except:
+            await u.message.reply_text("❌ Send USER_ID (only number):", reply_markup=BACK_KB); return
+        c.user_data['bc_uid'] = tid; c.user_data['awaiting'] = 'broadcast_capture'
+        await u.message.reply_text(f"✅ Target set: `{tid}`\nNow send text / photo / video.", parse_mode='Markdown', reply_markup=BACK_KB); return
+
+    # ---- Broadcast capture ----
     if aw == 'broadcast_capture' and is_owner(uid):
         c.user_data['awaiting'] = None
-        await do_broadcast(u.message, c.bot, uid, text)
+        tid = c.user_data.pop('bc_uid', None)
+        await do_broadcast(u.message, c.bot, uid, text, only_user_id=tid)
+        return
+
+    # ---- Custom admin time (typed) ----
+    if aw == 'adm_custom_time':
+        c.user_data['awaiting'] = None
+        if not is_owner(uid): return
+        t = c.user_data.pop('adm_target', None)
+        if not t:
+            await u.message.reply_text("❌ Session reset. Try again.", reply_markup=BACK_KB); return
+        txt = text.strip(); minus = txt.startswith('-')
+        try: nd = parse_duration(txt.lstrip('+-'))
+        except Exception:
+            await u.message.reply_text("❌ Format e.g. `45s`, `30m`, `2d 5h`, `1d`, `1w`", parse_mode='Markdown', reply_markup=BACK_KB); return
+        if nd is None:
+            await apply_admin_time(t, '+', None, text_ui=u.message)
+        else:
+            await apply_admin_time(t, '-' if minus else '+', nd, text_ui=u.message)
         return
 
     # ---- Special message text input ----
@@ -1087,38 +1145,37 @@ async def handle_text(u, c):
             await client.sign_in(phone=st['phone'], code=code, phone_code_hash=st['phone_code_hash'])
         except SessionPasswordNeededError:
             c.user_data['awaiting'] = '2fa_password'
-            # need reply holder
-            try: await u.message.reply_text("🔐 2FA password:", reply_markup=BACK_KB)
+            try: await u.message.reply_text("🔐 2FA password required:", reply_markup=BACK_KB)
             except: pass
             return
         except PhoneCodeInvalidError:
-            try: await u.message.reply_text("❌ Wrong code", reply_markup=BACK_KB)
+            try: await u.message.reply_text("❌ Wrong code — resend & try again.", reply_markup=BACK_KB)
             except: pass
             return
         except PhoneCodeExpiredError:
+            try: await client.disconnect()
+            except: pass
             try:
-                sent = await client.send_code_request(st['phone']); st['phone_code_hash']=sent.phone_code_hash
-                await u.message.reply_text("🔄 New code sent", reply_markup=BACK_KB)
-            except Exception as e: await u.message.reply_text(f"❌ {str(e)[:120]}", reply_markup=BACK_KB)
+                client = TelegramClient(StringSession(), st['api_id'], st['api_hash'], receive_updates=False)
+                await client.connect()
+                sent = await client.send_code_request(st['phone'])
+                st['client'] = client; st['phone_code_hash'] = sent.phone_code_hash; st['created'] = datetime.now()
+                await u.message.reply_text("🔄 OTP expired. New code sent — enter it now:", reply_markup=BACK_KB)
+            except Exception as e:
+                try: await u.message.reply_text(f"❌ {str(e)[:120]}", reply_markup=BACK_KB)
+                except: pass
             return
         except Exception as e:
             try: await u.message.reply_text(f"❌ {str(e)[:150]}", reply_markup=BACK_KB)
             except: pass
             return
-        me = None; fresh = None
-        try: await client.disconnect()
-        except: pass
+        # ---- SUCCESS: একবারই sign_in, এই client থেকেই session নাও (no double login loop) ----
         try:
-            c2 = TelegramClient(StringSession(), st['api_id'], st['api_hash'], receive_updates=False)
-            await c2.connect(); await c2.sign_in(phone=st['phone'], code=code, phone_code_hash=st['phone_code_hash'])
-            me = await c2.get_me(); fresh = c2.session.save(); await c2.disconnect()
-        except Exception:
-            try:
-                await client.connect(); me = await client.get_me(); fresh = client.session.save(); await client.disconnect()
-            except Exception as e:
-                try: await u.message.reply_text(f"❌ {str(e)[:120]}", reply_markup=BACK_KB)
-                except: pass
-                return
+            me = await client.get_me(); fresh = client.session.save(); await client.disconnect()
+        except Exception as e:
+            try: await u.message.reply_text(f"❌ {str(e)[:120]}", reply_markup=BACK_KB)
+            except: pass
+            return
         reached, rm = account_limit_reached(st['owner_id'])
         if reached:
             try: await u.message.reply_text(rm, reply_markup=BACK_KB)
