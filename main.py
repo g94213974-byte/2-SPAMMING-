@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """
-Telegram Mass Messaging Bot v7.0 FINAL ✨
+Telegram Mass Messaging Bot v7.1 FINAL ✨
 - v6.4 features (special msg per account, phone OTP fix, targeted broadcast)
 - v7: 20s pre-expiry warning + auto-remove expired admins
 - v7: Expired user → "bot deleted" screen with PLAN buttons (owner-customizable)
 - v7: QR payment flow → screenshot → owner Accept/Reject/Block
-- v7: Referral system (20% commission, balance-based purchase)
+- v7: Referral system (20% commission, balance-based purchase) — admins & owner can use
+- v7.1: Owner referral overview (who referred whom + names + plan validity)
+- v7.1: Single-user broadcast fixed (clear error if user never /start-ed)
 """
 import sys, os, asyncio, random, logging, json, threading, httpx, re, uuid
 from datetime import datetime, timedelta
@@ -53,7 +55,6 @@ SHOW_START_TO_OTHERS = True
 
 # ================= v7 STORE / PAYMENT / REFERRAL =================
 PLANS_FILE = "plans.json"
-PAYMENTS_FILE = "payments.json"
 REFS_FILE = "referrals.json"
 QR_FILE = "qr_config.json"
 BALANCES_FILE = "balances.json"
@@ -99,6 +100,11 @@ def set_referred(user_id, referrer_id):
     v = r[str(referrer_id)]
     if user_id not in v.setdefault('referred', []):
         v['referred'].append(user_id); save_json(REFS_FILE, r)
+
+def user_plan_time_str(uid):
+    a = get_admin(uid)
+    if not a: return "❌ no plan"
+    return remaining_time_str(a.get('expires_at'))
 
 async def activate_plan(user_id, days, plan_name="plan"):
     nd = datetime.now() + timedelta(days=days)
@@ -413,7 +419,7 @@ def home():
     all_a = get_all_accounts()
     run = sum(1 for a in all_a if account_stats.get(a['id'],{}).get('running',False))
     sent = sum(account_stats.get(a['id'],{}).get('sent',0) for a in all_a)
-    return f"v7.0 FINAL ✨ | Accounts:{len(all_a)} | Active:{run}/{len(all_a)} | Sent:{sent} | Admins:{len(load_admins())}"
+    return f"v7.1 FINAL ✨ | Accounts:{len(all_a)} | Active:{run}/{len(all_a)} | Sent:{sent} | Admins:{len(load_admins())}"
 @web_app.route("/health")
 def health(): return "OK", 200
 def run_flask(): web_app.run(host="0.0.0.0", port=int(os.environ.get("PORT",10000)), debug=False, use_reloader=False)
@@ -621,7 +627,13 @@ async def admin_expiry_checker():
                         try: await notify_user(uid, f"⏳ Your plan expires in {int(rem)} seconds!\n\n{EXPIRED_MSG}")
                         except: pass
             if changed: save_admins(keep)
-            valid = {OWNER_ID} | {a['user_id'] for a in keep if not a.get('expires_at') or (datetime.fromisoformat(a['expires_at']) > datetime.now() if a.get('expires_at') else True)}
+            valid = {OWNER_ID}
+            for a in keep:
+                exp = a.get('expires_at')
+                if not exp: valid.add(a['user_id']); continue
+                try:
+                    if datetime.fromisoformat(exp) > datetime.now(): valid.add(a['user_id'])
+                except: valid.add(a['user_id'])
             for acc in get_all_accounts():
                 oid = acc.get('owner_id', OWNER_ID)
                 if oid not in valid and account_stats.get(acc['id'], {}).get('running', False):
@@ -643,6 +655,7 @@ async def test_session_only(ss):
             except: pass
 
 def main_menu_keyboard(u):
+    ref_row = [[InlineKeyboardButton("👥 My Referral", callback_data='ref_menu')]]
     if is_owner(u):
         return InlineKeyboardMarkup([
             [InlineKeyboardButton("▶️ Start All", callback_data='start_all'),
@@ -652,7 +665,7 @@ def main_menu_keyboard(u):
             [InlineKeyboardButton("📱 Phone Login", callback_data='phone_login')],
             [InlineKeyboardButton("🗑️ Delete Account", callback_data='delete_account')],
             [InlineKeyboardButton("🎨 Profile Setup", callback_data='profile_setup')],
-            [InlineKeyboardButton("👑 Admin Panel", callback_data='admin_panel')]])
+            [InlineKeyboardButton("👑 Admin Panel", callback_data='admin_panel')]] + ref_row)
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("▶️ Start All", callback_data='start_all'),
          InlineKeyboardButton("⏹️ Stop All", callback_data='stop_all')],
@@ -660,7 +673,7 @@ def main_menu_keyboard(u):
         [InlineKeyboardButton("🔑 Session Login", callback_data='add_account')],
         [InlineKeyboardButton("📱 Phone Login", callback_data='phone_login')],
         [InlineKeyboardButton("🗑️ Delete Account", callback_data='delete_account')],
-        [InlineKeyboardButton("🎨 Profile Setup", callback_data='profile_setup')]])
+        [InlineKeyboardButton("🎨 Profile Setup", callback_data='profile_setup')]] + ref_row)
 
 def main_menu_text(u):
     accs = get_all_accounts(u)
@@ -674,7 +687,8 @@ def main_menu_text(u):
         cap = admin_max_accounts(u); cur = owner_acc_count(u)
         lim = f"\n🔢 Accounts: {cur}" if cap is None else f"\n🔢 Accounts: {cur}/{cap}"
         extra = exp + lim
-    return (f"✨ *Bot v7.0 FINAL* ✨\n{role}{extra}\n\n"
+    bal = f"\n💰 Balance: ₹{get_balance(u)}"
+    return (f"✨ *Bot v7.1 FINAL* ✨\n{role}{extra}{bal}\n\n"
             f"📊 Accounts: {len(accs)} (Running: {run})\n"
             f"⚡ Speed: {mn}-{mx}s | 🔄 Cycle: {cyc}s\n📨 Sent: {sent}")
 
@@ -688,8 +702,9 @@ async def start_command(u, c):
         rid = find_referrer_by_code(args[1][4:])
         if rid and rid != uid and get_referrer_of(uid) is None:
             set_referred(uid, rid)
+            rn = load_names().get(str(uid), {}).get('name', str(uid))
             try:
-                await c.bot.send_message(rid, f"👥 New referral joined: {eu.first_name} (ID: {uid})")
+                await c.bot.send_message(rid, f"👥 New referral joined: {rn} (ID: {uid})")
             except: pass
     if is_blocked(uid):
         await u.message.reply_text("🚫 You are blocked. Contact admin 👉 @G18GamerBacko"); return
@@ -743,7 +758,7 @@ async def do_broadcast(reply_target, bot, uid, caption="", media_file=None, medi
         try: await reply_target.reply_text("❌ No target available", reply_markup=BACK_KB)
         except: pass
         return
-    ok = 0
+    ok = 0; fails = []
     for t in targets:
         try:
             if media_type == 'photo': await bot.send_photo(chat_id=t, photo=media_file, caption=caption)
@@ -751,10 +766,22 @@ async def do_broadcast(reply_target, bot, uid, caption="", media_file=None, medi
             elif media_type == 'animation': await bot.send_animation(chat_id=t, animation=media_file, caption=caption)
             else: await bot.send_message(chat_id=t, text=caption)
             ok += 1
-        except Exception as e: logger.error(f"bc:{e}")
-    try:
-        who = "single user" if only_user_id is not None else "all admins"
-        await reply_target.reply_text(f"📢 Broadcast sent to {ok} ({who})", reply_markup=BACK_KB)
+        except Exception as e:
+            es = str(e)
+            if 'initiate conversation' in es or 'chat not found' in es.lower():
+                fails.append(f"ID {t}: user ne /start kore nai (bot message pathate parbe na)")
+            elif 'blocked' in es.lower() or 'forbidden' in es.lower():
+                fails.append(f"ID {t}: user bot ke block koreche")
+            else:
+                fails.append(f"ID {t}: {es[:60]}")
+            logger.error(f"bc to {t}: {es[:100]}")
+    who = "single user" if only_user_id is not None else "all admins"
+    txt = f"📢 Broadcast: ✅ {ok} delivered ({who})"
+    if fails:
+        txt += "\n\n❌ Failed:\n" + "\n".join(fails[:10])
+    if only_user_id is not None and ok == 0:
+        txt += "\n\n💡 Target user ke AGE bot e /start dite hobe, nahole pathano jabe na."
+    try: await reply_target.reply_text(txt, reply_markup=BACK_KB)
     except: pass
 
 async def button_click(u, c):
@@ -766,8 +793,8 @@ async def button_click(u, c):
 
     # ---- v7: free callbacks available to everyone (incl. expired users) ----
     ALLOWED_FREE_PREFIXES = ('buy_', 'paid_', 'refbuy_', 'back_start', 'ref_menu', 'ref_buy_menu')
-    ALLOWED_FREE_EXACT = ('payok_', 'payno_', 'payblock_')  # owner handled inside
-    is_free = any(d.startswith(x) for x in ALLOWED_FREE_PREFIXES) or any(d.startswith(x) for x in ALLOWED_FREE_EXACT)
+    ALLOWED_FREE_PREFIXES_OWNER_ONLY = ('payok_', 'payno_', 'payblock_')
+    is_free = any(d.startswith(x) for x in ALLOWED_FREE_PREFIXES) or any(d.startswith(x) for x in ALLOWED_FREE_PREFIXES_OWNER_ONLY)
     if not (is_owner(uid) or is_valid_admin(uid)) and not is_free:
         if SHOW_START_TO_OTHERS: await q.edit_message_text("⛔ Access denied / expired.")
         else: await q.edit_message_text(" ")
@@ -794,7 +821,11 @@ async def button_click(u, c):
     elif d == 'back_start':
         try: await q.message.delete()
         except: pass
-        await c.bot.send_message(uid, expired_panel_text(), parse_mode='Markdown', reply_markup=expired_panel_keyboard())
+        if is_owner(uid) or is_valid_admin(uid):
+            refresh_account_stats(uid); preload_display_names(get_all_accounts(uid))
+            await c.bot.send_message(uid, main_menu_text(uid), parse_mode='Markdown', reply_markup=main_menu_keyboard(uid))
+        else:
+            await c.bot.send_message(uid, expired_panel_text(), parse_mode='Markdown', reply_markup=expired_panel_keyboard())
     elif d.startswith('paid_'):
         pid = d.replace('paid_', '')
         plan = next((p for p in load_plans() if p['plan_id'] == pid), None)
@@ -1041,10 +1072,35 @@ async def button_click(u, c):
                InlineKeyboardButton("📋 Admin List", callback_data='admin_list')],
               [InlineKeyboardButton("🔢 Set Account Limit", callback_data='set_admin_limit'),
                InlineKeyboardButton("💰 Plans & QR", callback_data='plans_menu')],
+              [InlineKeyboardButton("👥 Referrals", callback_data='ref_admin')],
               [InlineKeyboardButton(f"👻 Start-msg: {'ON' if SHOW_START_TO_OTHERS else 'OFF'}", callback_data='toggle_startmsg')],
               [InlineKeyboardButton("📢 Broadcast", callback_data='broadcast_menu')],
               [InlineKeyboardButton("🔙 Back", callback_data='back_main')]]
         await q.edit_message_text("👑 *Admin Panel* ✨ _(Owner only)_", parse_mode='Markdown', reply_markup=InlineKeyboardMarkup(kb))
+    elif d == 'ref_admin':
+        if not is_owner(uid): return
+        refs = load_json(REFS_FILE, {})
+        lines = ["👥 *Referral Overview*\n"]
+        total_comm = 0.0
+        any_ref = False
+        for rid_s, v in refs.items():
+            rid = int(rid_s)
+            referred = v.get('referred', [])
+            earn = v.get('earnings', 0); total_comm += earn
+            bal = get_balance(rid)
+            lines.append(f"\n🔗 *Referrer:* {admin_label(rid)}")
+            lines.append(f"   💰 Balance: ₹{bal} | 📈 Earned: ₹{earn}")
+            if referred:
+                any_ref = True
+                for ruid in referred:
+                    rnm = load_names().get(str(ruid), {}).get('name', str(ruid))
+                    lines.append(f"   ↳ 👤 {rnm} (ID: {ruid}) | ⏳ {user_plan_time_str(ruid)}")
+            else:
+                lines.append("   ↳ _no referrals yet_")
+        if not refs:
+            lines.append("_No referral data yet._")
+        lines.append(f"\n📊 Total commission paid: ₹{round(total_comm, 2)}")
+        await q.edit_message_text("\n".join(lines), parse_mode='Markdown', reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data='admin_panel')]]))
     elif d == 'broadcast_menu':
         if not is_owner(uid): return
         kb = InlineKeyboardMarkup([
@@ -1059,9 +1115,12 @@ async def button_click(u, c):
                                   parse_mode='Markdown', reply_markup=BACK_KB)
     elif d == 'bc_one':
         if not is_owner(uid): return
-        c.user_data['awaiting'] = 'broadcast_target'
-        await q.edit_message_text("👤 Send the target USER_ID (only number):\nCancel = /cancel",
-                                  parse_mode='Markdown', reply_markup=BACK_KB)
+        c.user_data['awaiting'] = 'broadcast_target'; c.user_data.pop('bc_uid', None)
+        await q.edit_message_text(
+            "👤 Send the target USER_ID (only number):\n\n"
+            "⚠️ User must have /start-ed the bot at least once, otherwise delivery will fail.\n"
+            "Cancel = /cancel",
+            parse_mode='Markdown', reply_markup=BACK_KB)
     elif d == 'set_admin_limit':
         if not is_owner(uid): return
         c.user_data['awaiting'] = 'admin_limit'
@@ -1255,12 +1314,15 @@ async def handle_photo(u, c):
     if c.user_data.get('awaiting') == 'broadcast_capture' and is_owner(uid):
         c.user_data['awaiting'] = None
         tid = c.user_data.pop('bc_uid', None)
+        if tid is None:
+            await u.message.reply_text("❌ Target lost — abar 👤 To One User theke shuru koro.", reply_markup=BACK_KB); return
         if u.message.video:
             await do_broadcast(u.message, c.bot, uid, u.message.caption or "", u.message.video.file_id, 'video', only_user_id=tid)
         elif u.message.photo:
             await do_broadcast(u.message, c.bot, uid, u.message.caption or "", u.message.photo[-1].file_id, 'photo', only_user_id=tid)
         elif u.message.animation:
             await do_broadcast(u.message, c.bot, uid, u.message.caption or "", u.message.animation.file_id, 'animation', only_user_id=tid)
+        return
 
 async def handle_text(u, c):
     uid = u.effective_user.id
@@ -1275,6 +1337,9 @@ async def handle_text(u, c):
 
     # ---- Single-user broadcast target ----
     if aw == 'broadcast_target' and is_owner(uid):
+        if text.lower() == '/cancel':
+            c.user_data['awaiting'] = None; c.user_data.pop('bc_uid', None)
+            await u.message.reply_text("❌ Cancelled.", reply_markup=BACK_KB); return
         try: tid = int(text.strip())
         except:
             await u.message.reply_text("❌ Send USER_ID (only number):", reply_markup=BACK_KB); return
@@ -1285,6 +1350,8 @@ async def handle_text(u, c):
     if aw == 'broadcast_capture' and is_owner(uid):
         c.user_data['awaiting'] = None
         tid = c.user_data.pop('bc_uid', None)
+        if tid is None:
+            await u.message.reply_text("❌ Target lost — Admin Panel → Broadcast → 👤 To One User theke abar shuru koro.", reply_markup=BACK_KB); return
         await do_broadcast(u.message, c.bot, uid, text, only_user_id=tid)
         return
 
