@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-Telegram Mass Messaging Bot v1.1 FINAL (CLEAN MERGE, referral removed)
+Telegram Mass Messaging Bot v1.1 FINAL (CLEAN MERGE, referral removed, OTP markdown-safe)
 - Per-account SPECIAL MESSAGE
-- Phone OTP login (single sign_in, no auto-resend loop)
+- Phone OTP login (single sign_in, no auto-resend loop) - Markdown-safe now
 - Auto-remove expired admins + 20s pre-expiry warning
 - Owner custom admin time (+ add / - subtract / = set), 1s..any
 - Targeted broadcast to a single user with error reporting
@@ -82,8 +82,7 @@ def load_qr(): return load_json(QR_FILE, {})
 def save_qr(d): save_json(QR_FILE, d)
 def is_blocked(uid): return uid in load_json(BLOCKED_FILE, [])
 
-def load_names():
-    return load_json(NAME_FILE, {})
+def load_names(): return load_json(NAME_FILE, {})
 def save_names(d=None):
     if d is None: d = load_names()
     save_json(NAME_FILE, d)
@@ -730,7 +729,7 @@ async def button_click(u, c):
         plan = next((p for p in load_plans() if p['plan_id'] == pid), None)
         if not plan:
             await q.edit_message_text("❌ Plan unavailable", reply_markup=expired_panel_keyboard()); return
-        kb = [[InlineKeyboardButton("✅ I Have Paid", callback_data=f'paid_{pid}')],
+        kb = [[InlineKeyboardButton("✅ I Have Paid", callback_data=f'paid_{pid}'),
               [InlineKeyboardButton("🔙 Back", callback_data='back_start')]]
         cap = f"\n\n💎 {plan['name']}\n💸 Price: ₹{plan['price']}\n⏳ Duration: {plan['days']} days"
         qr = load_qr()
@@ -851,8 +850,8 @@ async def button_click(u, c):
         if 0 <= i < len(m): m.pop(i); save_messages_for(uid, m)
         await q.edit_message_text("🗑️ Deleted", reply_markup=BACK_KB)
     elif d == 'reset_messages': save_messages_for(uid, [MESSAGE]); await q.edit_message_text("🔄 Reset done", reply_markup=BACK_KB)
-    elif d == 'set_min': c.user_data['awaiting'] = 'set_min'; await q.edit_message_text(f"⏱️ Enter Min seconds:", reply_markup=BACK_KB)
-    elif d == 'set_max': c.user_data['awaiting'] = 'set_max'; await q.edit_message_text(f"⏱️ Enter Max seconds:", reply_markup=BACK_KB)
+    elif d == 'set_min': c.user_data['awaiting'] = 'set_min'; await q.edit_message_text("⏱️ Enter Min seconds:", reply_markup=BACK_KB)
+    elif d == 'set_max': c.user_data['awaiting'] = 'set_max'; await q.edit_message_text("⏱️ Enter Max seconds:", reply_markup=BACK_KB)
     elif d == 'set_cycle': c.user_data['awaiting'] = 'set_cycle'; await q.edit_message_text("🔄 Enter cycle seconds (5+):", reply_markup=BACK_KB)
 
     elif d == 'special_msg_menu':
@@ -1282,13 +1281,15 @@ async def handle_text(u, c):
             if v < 5: await u.message.reply_text("❌ Cycle >= 5", reply_markup=BACK_KB); return
             set_speed(uid, cycle=v)
         await u.message.reply_text(f"✅ Speed updated: {speed_for(uid)}", reply_markup=BACK_KB); return
+
+    # ================= PHONE LOGIN (MARKDOWN-SAFE: plain text only) =================
     if aw == 'phone_number':
         c.user_data['awaiting'] = None
         try:
             ph = text.strip()
             if not ph.startswith('+'): ph = '+' + ph
             if not re.match(r'^\+\d{7,15}$', ph):
-                await u.message.reply_text("❌ Invalid! Example `+91XXXXXXXXXX`", reply_markup=BACK_KB); return
+                await u.message.reply_text("❌ Invalid! Example +91XXXXXXXXXX", reply_markup=BACK_KB); return
             reached, rm = account_limit_reached(uid)
             if reached: await u.message.reply_text(rm, reply_markup=BACK_KB); return
             if not API_ID_1 or not API_HASH_1:
@@ -1307,8 +1308,10 @@ async def handle_text(u, c):
                 phone_login_states[lid] = {'phone': ph, 'owner_id': uid, 'client': client,
                                            'phone_code_hash': sent.phone_code_hash, 'tries': 0}
                 c.user_data['awaiting'] = 'otp_code'; c.user_data['login_id'] = lid
-                try: await sm.edit_text(f"✉️ OTP sent to `{ph}`\n\nTelegram app e code ashbe. Code expire hole abar 📱 Phone Login chapo.",
-                                        parse_mode='Markdown', reply_markup=BACK_KB)
+                # PLAIN TEXT (no Markdown) so phone/input can't break entity parsing
+                try:
+                    await sm.edit_text(f"✉️ OTP sent to {ph}\n\nTelegram app e code ashbe. "
+                                       f"Code expire hole abar Phone Login chapo.", reply_markup=BACK_KB)
                 except Exception: pass
             except Exception as e:
                 if client:
@@ -1318,12 +1321,14 @@ async def handle_text(u, c):
         except Exception as e:
             await u.message.reply_text(f"❌ {str(e)[:120]}", reply_markup=BACK_KB)
         return
+
+    # OTP code
     if aw == 'otp_code':
         c.user_data['awaiting'] = None
         lid = c.user_data.pop('login_id', None)
         st = phone_login_states.get(lid)
         if not st or not st.get('client'):
-            await u.message.reply_text("❌ Login session lost. Abar 📱 Phone Login chapo.", reply_markup=BACK_KB); return
+            await u.message.reply_text("❌ Login session lost. Abar Phone Login chapo.", reply_markup=BACK_KB); return
         code = re.sub(r'\D', '', text)
         try:
             await st['client'].sign_in(phone=st['phone'], code=code, phone_code_hash=st['phone_code_hash'])
@@ -1334,14 +1339,14 @@ async def handle_text(u, c):
             try: await st['client'].disconnect()
             except Exception: pass
             phone_login_states.pop(lid, None)
-            await u.message.reply_text("⌛ Code EXPIRED. Abar 📱 Phone Login → number pathao.", reply_markup=BACK_KB); return
+            await u.message.reply_text("⌛ Code EXPIRED. Abar Phone Login → number pathao.", reply_markup=BACK_KB); return
         except PhoneCodeInvalidError:
             st['tries'] += 1
             if st['tries'] >= 3:
                 try: await st['client'].disconnect()
                 except Exception: pass
                 phone_login_states.pop(lid, None)
-                await u.message.reply_text("❌ 3 bar bhul. Abar 📱 Phone Login.", reply_markup=BACK_KB); return
+                await u.message.reply_text("❌ 3 bar bhul. Abar Phone Login.", reply_markup=BACK_KB); return
             c.user_data['awaiting'] = 'otp_code'; c.user_data['login_id'] = lid
             await u.message.reply_text(f"❌ Bhul code ({st['tries']}/3):", reply_markup=BACK_KB); return
         except Exception as e:
@@ -1355,12 +1360,14 @@ async def handle_text(u, c):
         phone_login_states.pop(lid, None)
         await finish_phone_login(u, c, uid, ph, s)
         return
+
+    # 2FA password
     if aw == 'two_fa':
         c.user_data['awaiting'] = None
         lid = c.user_data.pop('login_id', None)
         st = phone_login_states.get(lid)
         if not st or not st.get('client'):
-            await u.message.reply_text("❌ Session lost. Abar 📱 Phone Login.", reply_markup=BACK_KB); return
+            await u.message.reply_text("❌ Session lost. Abar Phone Login.", reply_markup=BACK_KB); return
         try:
             await st['client'].sign_in(password=text)
         except Exception as e:
@@ -1372,6 +1379,8 @@ async def handle_text(u, c):
         phone_login_states.pop(lid, None)
         await finish_phone_login(u, c, uid, ph, s)
         return
+
+    # Session string login
     if aw == 'add_account':
         c.user_data['awaiting'] = None
         try:
@@ -1394,21 +1403,24 @@ async def handle_text(u, c):
     if is_owner(uid) or is_valid_admin(uid):
         await u.message.reply_text("Menu theke option bacho 👆", reply_markup=main_menu_keyboard(uid))
 
+# ================= PHONE LOGIN SUCCESS (plain text, no Markdown) =================
 async def finish_phone_login(u, c, uid, ph, session_str):
     try:
         reached, rm = account_limit_reached(uid)
-        if reached: await u.message.reply_text(rm, reply_markup=BACK_KB); return
-        nid = add_phone_auth_account(human_name_from_session(session_str), session_str, uid, ph)
+        if reached:
+            await u.message.reply_text(rm, reply_markup=BACK_KB); return
+        # validate + fetch real name before storing
+        if not API_ID_1 or not API_HASH_1:
+            await u.message.reply_text("❌ API keys missing!", reply_markup=BACK_KB); return
+        tmp = TelegramClient(StringSession(session_str), API_ID_1, API_HASH_1, receive_updates=False)
+        await tmp.start(); me = await tmp.get_me(); name = human_name(me)
+        sstr2 = tmp.session.save(); await tmp.disconnect()
+        nid = add_phone_auth_account(name, sstr2, uid, ph)
         refresh_account_stats(uid)
-        await u.message.reply_text(f"✅ Logged in: {display_names.get(nid)} (`{ph}`)",
-                                   parse_mode='Markdown', reply_markup=BACK_KB)
+        # plain text - no Markdown so names/symbols can't break parsing
+        await u.message.reply_text(f"✅ Logged in: {name} ({ph})", reply_markup=BACK_KB)
     except Exception as e:
         await u.message.reply_text(f"❌ {str(e)[:150]}", reply_markup=BACK_KB)
-
-def human_name_from_session(session_str):
-    # best-effort; replaced after real get_me in async validation earlier is not stored,
-    # so fallback to phone label
-    return f"User_{session_str[:6]}"
 
 # ---------------- data persistence ----------------
 def load_data():
