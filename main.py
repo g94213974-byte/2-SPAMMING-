@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-Telegram Mass Messaging Bot v6.4 ✨
+Telegram Mass Messaging Bot v6.4 FINAL ✨
 - v6.3+ per-account SPECIAL MESSAGE (only that id spams the pinned msg; others normal)
-- FIXED: Phone OTP double-login loop (single sign_in, no repeated resend)
+- FIXED: Phone OTP loop — single sign_in, NO auto-resend, clean reset on expired code
 - Auto-remove EXPIRED admins from list + notify them
 - Owner can type CUSTOM admin time (1s .. any) in Admin List → ✍️ Custom Time
 - Targeted broadcast to a SINGLE user (by USER_ID)
@@ -324,7 +324,7 @@ def home():
     all_a = get_all_accounts()
     run = sum(1 for a in all_a if account_stats.get(a['id'],{}).get('running',False))
     sent = sum(account_stats.get(a['id'],{}).get('sent',0) for a in all_a)
-    return f"v6.4 ✨ | Accounts:{len(all_a)} | Active:{run}/{len(all_a)} | Sent:{sent} | Admins:{len(load_admins())}"
+    return f"v6.4 FINAL ✨ | Accounts:{len(all_a)} | Active:{run}/{len(all_a)} | Sent:{sent} | Admins:{len(load_admins())}"
 @web_app.route("/health")
 def health(): return "OK", 200
 def run_flask(): web_app.run(host="0.0.0.0", port=int(os.environ.get("PORT",10000)), debug=False, use_reloader=False)
@@ -577,7 +577,7 @@ def main_menu_text(u):
         cap = admin_max_accounts(u); cur = owner_acc_count(u)
         lim = f"\n🔢 Accounts: {cur}" if cap is None else f"\n🔢 Accounts: {cur}/{cap}"
         extra = exp + lim
-    return (f"✨ *Bot v6.4* ✨\n{role}{extra}\n\n"
+    return (f"✨ *Bot v6.4 FINAL* ✨\n{role}{extra}\n\n"
             f"📊 Accounts: {len(accs)} (Running: {run})\n"
             f"⚡ Speed: {mn}-{mx}s | 🔄 Cycle: {cyc}s\n📨 Sent: {sent}")
 
@@ -1133,14 +1133,25 @@ async def handle_text(u, c):
             try: await u.message.reply_text(f"❌ {str(e)[:120]}", reply_markup=BACK_KB)
             except: pass
         return
+
+    # ===== OTP CODE (FIXED — single sign_in, no auto-resend, clean reset) =====
     if aw == 'otp_code':
         lid = c.user_data.get('login_id'); st = phone_login_states.get(lid) if lid else None
         if not st:
             c.user_data['awaiting'] = None
             await u.message.reply_text("⏳ Flow reset. Phone Login again.", reply_markup=BACK_KB); return
         code = text.strip().replace(' ','').replace('-','')
-        if not code.isdigit(): await u.message.reply_text("❌ digits only", reply_markup=BACK_KB); return
-        client = st['client']
+        if not code.isdigit():
+            await u.message.reply_text("❌ digits only", reply_markup=BACK_KB); return
+        client = st.get('client')
+        # client মারা গেলে ফের reconnect (নতুন code request নয়)
+        try:
+            if not client or not client.is_connected():
+                client = TelegramClient(StringSession(), st['api_id'], st['api_hash'], receive_updates=False)
+                await client.connect()
+                st['client'] = client
+        except Exception:
+            pass
         try:
             await client.sign_in(phone=st['phone'], code=code, phone_code_hash=st['phone_code_hash'])
         except SessionPasswordNeededError:
@@ -1149,27 +1160,30 @@ async def handle_text(u, c):
             except: pass
             return
         except PhoneCodeInvalidError:
-            try: await u.message.reply_text("❌ Wrong code — resend & try again.", reply_markup=BACK_KB)
+            try: await u.message.reply_text("❌ Wrong code. Recheck & send again.", reply_markup=BACK_KB)
             except: pass
             return
         except PhoneCodeExpiredError:
+            # auto-resend নেই — পুরো flow reset
             try: await client.disconnect()
             except: pass
-            try:
-                client = TelegramClient(StringSession(), st['api_id'], st['api_hash'], receive_updates=False)
-                await client.connect()
-                sent = await client.send_code_request(st['phone'])
-                st['client'] = client; st['phone_code_hash'] = sent.phone_code_hash; st['created'] = datetime.now()
-                await u.message.reply_text("🔄 OTP expired. New code sent — enter it now:", reply_markup=BACK_KB)
-            except Exception as e:
-                try: await u.message.reply_text(f"❌ {str(e)[:120]}", reply_markup=BACK_KB)
-                except: pass
+            phone_login_states.pop(lid, None); c.user_data.pop('login_id', None); c.user_data['awaiting'] = None
+            try: await u.message.reply_text(
+                "⚠️ Code expired/mismatch.\n\nবেশিরভাগ সময় একই বটের ২টা instance চললে এমন হয় — "
+                "Render-এ পুরনো বিল্ড বন্ধ করুন।\n\nআবার চাইলে 📱 Phone Login থেকে নতুন শুরু করুন, "
+                "নয়তো সোজা 🔑 Session String login ব্যবহার করুন (সবচেয়ে নির্ভরযোগ্য)।",
+                reply_markup=BACK_KB)
+            except: pass
+            return
+        except FloodWaitError as fw:
+            try: await u.message.reply_text(f"⏳ Flood wait {fw.seconds}s — পরে চেষ্টা করুন।", reply_markup=BACK_KB)
+            except: pass
             return
         except Exception as e:
             try: await u.message.reply_text(f"❌ {str(e)[:150]}", reply_markup=BACK_KB)
             except: pass
             return
-        # ---- SUCCESS: একবারই sign_in, এই client থেকেই session নাও (no double login loop) ----
+        # ---- সফল: একই client থেকে session (২য় sign_in নেই) ----
         try:
             me = await client.get_me(); fresh = client.session.save(); await client.disconnect()
         except Exception as e:
@@ -1196,6 +1210,8 @@ async def handle_text(u, c):
         try: await u.message.reply_text(f"✅ Logged in! 👤 {fname}", reply_markup=BACK_KB)
         except: pass
         return
+
+    # ===== 2FA password =====
     if aw == '2fa_password':
         lid = c.user_data.get('login_id'); st = phone_login_states.get(lid) if lid else None
         if not st:
