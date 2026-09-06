@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
 """
-Telegram Mass Messaging Bot v1.0 FINAL ✨
+Telegram Mass Messaging Bot v1.1 FINAL ✨
 - Per-account SPECIAL MESSAGE (only that id spams the pinned msg; others normal)
 - FIXED: Phone OTP loop — single sign_in, NO auto-resend, clean reset on expired code
-- Auto-remove EXPIRED admins from list + notify them (+ 20s pre-expiry warning)
-- Owner can type CUSTOM admin time (1s .. any) in Admin List → ✍️ Custom Time
-- Targeted broadcast to a SINGLE user (by USER_ID) with clear error reporting
-- Expired/new users see 💎 Available Plans buy panel (owner-customizable + QR)
-- QR payment flow → screenshot → owner Accept/Reject/Block
-- Referral system: counts ONLY when referred user BUYS (pending → confirmed on purchase)
-  20% commission credited at purchase time; /start alone never counts
+- Auto-remove EXPIRED admins + 20s pre-expiry warning
+- Owner custom admin time (+ add / - subtract, 1s .. any)
+- Targeted broadcast to a SINGLE user with clear error reporting
+- Buy panel + QR payment → screenshot → owner Accept/Reject/Block
+  v1.1 FIX: Accept/Reject/Block buttons now work on PHOTO messages too
+- Confirm message: "✅ Payment confirmed! ... CLICK👉 /start"
+- Referral: counts ONLY on purchase (pending → confirmed) + 20% commission
 - Owner referral overview (who referred whom + names + plan validity)
 """
 import sys, os, asyncio, random, logging, json, threading, httpx, re, uuid
@@ -105,7 +105,6 @@ def set_referred(user_id, referrer_id):
         v['referred'].append(user_id); save_json(REFS_FILE, r)
 
 def set_pending_ref(user_id, referrer_id):
-    """Referral click = pending only. Counts only when user buys."""
     if user_id == referrer_id: return
     if get_referrer_of(user_id) is not None: return
     r = load_json(REFS_FILE, {})
@@ -127,6 +126,23 @@ def user_plan_time_str(uid):
     if not a: return "❌ no plan"
     return remaining_time_str(a.get('expires_at'))
 
+# v1.1 FIX: photo caption + text dutoi edit korte pare — fail hole notun message
+async def safe_edit(q, bot, txt, kb=None):
+    try:
+        await q.edit_message_text(txt, reply_markup=kb)
+        return
+    except Exception:
+        pass
+    try:
+        await q.edit_message_caption(caption=txt, reply_markup=kb)
+        return
+    except Exception:
+        pass
+    try:
+        await bot.send_message(q.from_user.id, txt, reply_markup=kb)
+    except Exception:
+        pass
+
 async def activate_plan(user_id, days, plan_name="plan", price=0.0):
     nd = datetime.now() + timedelta(days=days)
     admins = load_admins(); a = get_admin(user_id)
@@ -145,9 +161,13 @@ async def activate_plan(user_id, days, plan_name="plan", price=0.0):
     save_admins(admins)
     warned_users.discard(user_id)
     gg = get_admin(user_id)
+    valid = remaining_time_str(gg.get('expires_at') if gg else None)
+    # v1.1: plain text (Markdown parse error avoid) + CLICK👉 /start
     try:
-        await notify_user(user_id, f"✅ *Payment confirmed!*\n\n💎 Plan: {plan_name}\n⏳ Your validity: {remaining_time_str(gg.get('expires_at') if gg else None)}")
-    except: pass
+        await notify_plain(user_id,
+            f"✅ Payment confirmed!\n\n💎 Plan: {plan_name}\n⏳ Your validity: {valid}\n\nCLICK👉 /start")
+    except Exception as e:
+        logger.error(f"confirm msg: {e}")
     # referral count + commission ONLY on purchase
     rid = get_pending_ref(user_id)
     if rid is not None and rid != user_id and price > 0:
@@ -160,7 +180,7 @@ async def activate_plan(user_id, days, plan_name="plan", price=0.0):
             r[str(rid)]['earnings'] = r[str(rid)].get('earnings', 0) + comm
             save_json(REFS_FILE, r)
         unm = load_names().get(str(user_id), {}).get('name', str(user_id))
-        try: await notify_user(rid, f"💰 You referred {unm} (ID: {user_id}).\nThey bought '{plan_name}' for ₹{price}.\n✅ 20% (₹{comm}) added to your balance.")
+        try: await notify_plain(rid, f"💰 You referred {unm} (ID: {user_id}).\nThey bought '{plan_name}' for ₹{price}.\n✅ 20% (₹{comm}) added to your balance.")
         except: pass
 
 def expired_panel_keyboard():
@@ -454,7 +474,7 @@ def home():
     all_a = get_all_accounts()
     run = sum(1 for a in all_a if account_stats.get(a['id'],{}).get('running',False))
     sent = sum(account_stats.get(a['id'],{}).get('sent',0) for a in all_a)
-    return f"v1.0 FINAL ✨ | Accounts:{len(all_a)} | Active:{run}/{len(all_a)} | Sent:{sent} | Admins:{len(load_admins())}"
+    return f"v1.1 FINAL ✨ | Accounts:{len(all_a)} | Active:{run}/{len(all_a)} | Sent:{sent} | Admins:{len(load_admins())}"
 @web_app.route("/health")
 def health(): return "OK", 200
 def run_flask(): web_app.run(host="0.0.0.0", port=int(os.environ.get("PORT",10000)), debug=False, use_reloader=False)
@@ -522,6 +542,13 @@ async def notify_user(uid, t):
         b = Application.builder().token(BOT_TOKEN).build()
         await b.bot.send_message(chat_id=uid, text=t, parse_mode='Markdown')
     except: pass
+async def notify_plain(uid, t):
+    """Markdown chara safe notify (user names with special chars thik thake)."""
+    try:
+        b = Application.builder().token(BOT_TOKEN).build()
+        await b.bot.send_message(chat_id=uid, text=t)
+    except Exception as e:
+        logger.error(f"notify_plain to {uid}: {e}")
 async def join_link(client, link):
     link = link.strip().replace('http://','https://')
     if not link: raise ValueError("empty")
@@ -652,14 +679,14 @@ async def admin_expiry_checker():
                     for acc in get_all_accounts(uid):
                         if account_stats.get(acc['id'], {}).get('running', False): stop_account(acc['id'])
                         await disconnect_client(acc['id'])
-                    try: await notify_user(uid, f"⛔ *Plan expired*\n\n{EXPIRED_MSG}")
+                    try: await notify_plain(uid, f"⛔ Plan expired\n\n{EXPIRED_MSG}")
                     except: pass
                     warned_users.discard(uid)
                 else:
                     keep.append(a)
                     if rem <= WARN_BEFORE_SEC and uid != OWNER_ID and uid not in warned_users:
                         warned_users.add(uid)
-                        try: await notify_user(uid, f"⏳ Your plan expires in {int(rem)} seconds!\n\n{EXPIRED_MSG}")
+                        try: await notify_plain(uid, f"⏳ Your plan expires in {int(rem)} seconds!\n\n{EXPIRED_MSG}")
                         except: pass
             if changed: save_admins(keep)
             valid = {OWNER_ID}
@@ -723,7 +750,7 @@ def main_menu_text(u):
         lim = f"\n🔢 Accounts: {cur}" if cap is None else f"\n🔢 Accounts: {cur}/{cap}"
         extra = exp + lim
     bal = f"\n💰 Balance: ₹{get_balance(u)}"
-    return (f"✨ *Bot v1.0 FINAL* ✨\n{role}{extra}{bal}\n\n"
+    return (f"✨ *Bot v1.1 FINAL* ✨\n{role}{extra}{bal}\n\n"
             f"📊 Accounts: {len(accs)} (Running: {run})\n"
             f"⚡ Speed: {mn}-{mx}s | 🔄 Cycle: {cyc}s\n📨 Sent: {sent}")
 
@@ -887,31 +914,38 @@ async def button_click(u, c):
         kb = [[InlineKeyboardButton(f"{p['name']} — ₹{p['price']} ({p['days']}d)", callback_data=f"buy_{p['plan_id']}")] for p in load_plans()]
         kb.append([InlineKeyboardButton("🔙 Back", callback_data='back_start')])
         await q.edit_message_text(f"💰 Your balance: ₹{get_balance(uid)}\nChoose a plan:", parse_mode='Markdown', reply_markup=InlineKeyboardMarkup(kb))
-    # ---- owner payment review ----
+    # ---- owner payment review (v1.1 FIX: photo caption edit safe) ----
     elif d.startswith('payok_'):
         if not is_owner(uid): return
-        _, buyer_s, pid = d.split('_', 2)
-        buyer = int(buyer_s)
-        plan = next((p for p in load_plans() if p['plan_id'] == pid), None)
-        if not plan:
-            await q.edit_message_text("❌ Plan gone"); return
-        await activate_plan(buyer, int(plan['days']), plan['name'], price=float(plan['price']))
-        try: await q.edit_message_text(f"✅ Accepted payment of {buyer} ({plan['name']})")
-        except: pass
+        try:
+            _, buyer_s, pid = d.split('_', 2)
+            buyer = int(buyer_s)
+            plan = next((p for p in load_plans() if p['plan_id'] == pid), None)
+            if not plan:
+                await safe_edit(q, c.bot, "❌ Plan gone"); return
+            await activate_plan(buyer, int(plan['days']), plan['name'], price=float(plan['price']))
+            await safe_edit(q, c.bot, f"✅ Accepted payment of {buyer} ({plan['name']})")
+        except Exception as e:
+            logger.error(f"payok: {e}")
+            await safe_edit(q, c.bot, f"❌ Error: {str(e)[:100]}")
     elif d.startswith('payno_'):
         if not is_owner(uid): return
-        buyer = int(d.split('_')[1])
-        try: await c.bot.send_message(buyer, "❌ Your payment was rejected. Contact admin 👉 @G18GamerBacko")
-        except: pass
-        await q.edit_message_text("❌ Rejected & user notified")
+        try:
+            buyer = int(d.split('_')[1])
+            await notify_plain(buyer, "❌ Your payment was rejected. Contact admin 👉 @G18GamerBacko")
+            await safe_edit(q, c.bot, "❌ Rejected & user notified")
+        except Exception as e:
+            await safe_edit(q, c.bot, f"❌ Error: {str(e)[:100]}")
     elif d.startswith('payblock_'):
         if not is_owner(uid): return
-        buyer = int(d.split('_')[1])
-        try: await c.bot.send_message(buyer, "🚫 You have been blocked for fake payment.")
-        except: pass
-        bl = load_json(BLOCKED_FILE, [])
-        if buyer not in bl: bl.append(buyer); save_json(BLOCKED_FILE, bl)
-        await q.edit_message_text("🚫 User blocked")
+        try:
+            buyer = int(d.split('_')[1])
+            await notify_plain(buyer, "🚫 You have been blocked for fake payment.")
+            bl = load_json(BLOCKED_FILE, [])
+            if buyer not in bl: bl.append(buyer); save_json(BLOCKED_FILE, bl)
+            await safe_edit(q, c.bot, "🚫 User blocked")
+        except Exception as e:
+            await safe_edit(q, c.bot, f"❌ Error: {str(e)[:100]}")
 
     elif d == 'start_all':
         p = []
@@ -1151,7 +1185,7 @@ async def button_click(u, c):
     elif d == 'toggle_startmsg':
         if not is_owner(uid): return
         SHOW_START_TO_OTHERS = not SHOW_START_TO_OTHERS; save_data()
-        await q.edit_message_text(f"👻 Show msg to non-admins on /start: {'ON' if SHOW_START_TO_OTHERS else 'OFF'}", reply_markup=BACK_KB)
+        await q.edit_message_text(f"👻 Show msg to non-admins on old menu press: {'ON' if SHOW_START_TO_OTHERS else 'OFF'}", reply_markup=BACK_KB)
     elif d == 'admin_list':
         if not is_owner(uid): return
         admins = load_admins()
@@ -1203,7 +1237,7 @@ async def button_click(u, c):
         kb = InlineKeyboardMarkup([
             [InlineKeyboardButton("➕30d", callback_data=f'admop_{t}_+30'), InlineKeyboardButton("➕100d", callback_data=f'admop_{t}_+100')],
             [InlineKeyboardButton("➖10d", callback_data=f'admop_{t}_-10'), InlineKeyboardButton("➖30d", callback_data=f'admop_{t}_-30')],
-            [InlineKeyboardButton("✍️ Custom Time", callback_data=f'adm_time_{t}')],
+            [InlineKeyboardButton("✍️ Custom Time (+/-)", callback_data=f'adm_time_{t}')],
             [InlineKeyboardButton("♾️ Permanent", callback_data=f'admop_{t}_=perm'), InlineKeyboardButton("⛔ Expire", callback_data=f'admop_{t}_=0')],
             [InlineKeyboardButton("🔙 Back", callback_data='admin_list')]])
         accs = get_all_accounts(t)
@@ -1216,9 +1250,13 @@ async def button_click(u, c):
         except: await q.edit_message_text("❌ Parse error", reply_markup=BACK_KB); return
         c.user_data['awaiting'] = 'adm_custom_time'; c.user_data['adm_target'] = t
         await q.edit_message_text(
-            "⏳ *Custom Time (Add)*\n\nSend duration — 1 second থেকে যত খুশি:\n"
-            "🔹 `45s` → 45 sec\n🔹 `30m` → 30 min\n🔹 `2d 5h` → 2d 5h\n🔹 `1d` → 1 day\n🔹 `1w` → 1 week\n"
-            "(`-30m` দিলে subtract)\n\nএখন লিখে পাঠান:",
+            "⏳ *Custom Time*\n\n➕ TIME BARANO: shuru te `+` din (ba + chara o cholbe):\n"
+            "🔹 `+45s` → 45 sec barabe\n🔹 `+30m` → 30 min barabe\n🔹 `+2d 5h` → 2d 5h barabe\n🔹 `+1w` → 1 week barabe\n\n"
+            "➖ TIME KOMANO: shuru te `-` din:\n"
+            "🔹 `-30m` → 30 min komabe\n🔹 `-1d` → 1 din komabe\n🔹 `-2d 5h` → 2d 5h komabe\n\n"
+            "⚖️ EXACT SET korte hole `=` din:\n"
+            "🔹 `=45s` → exactly 45 sec (set hobe)\n🔹 `=perm` → permanent\n\n"
+            "এখন লিখে পাঠান:",
             parse_mode='Markdown', reply_markup=BACK_KB)
     elif d.startswith('admop_'):
         if not is_owner(uid): return
@@ -1380,7 +1418,7 @@ async def handle_text(u, c):
         save_plans(plans)
         await u.message.reply_text("✅ Plan added!", reply_markup=BACK_KB); return
 
-    # ---- Custom admin time (typed) ----
+    # ---- Custom admin time (+ add / - subtract / = set) ----
     if aw == 'adm_custom_time':
         c.user_data['awaiting'] = None
         if not is_owner(uid): return
@@ -1390,7 +1428,7 @@ async def handle_text(u, c):
         txt = text.strip(); minus = txt.startswith('-')
         try: nd = parse_duration(txt.lstrip('+-'))
         except Exception:
-            await u.message.reply_text("❌ Format e.g. `45s`, `30m`, `2d 5h`, `1d`, `1w`", parse_mode='Markdown', reply_markup=BACK_KB); return
+            await u.message.reply_text("❌ Format e.g. `+30m` (barano), `-30m` (komano), `=45s` (exact), `1d 5h`", parse_mode='Markdown', reply_markup=BACK_KB); return
         if nd is None:
             await apply_admin_time(t, '+', None, text_ui=u.message)
         else:
@@ -1469,231 +1507,272 @@ async def handle_text(u, c):
                 client = TelegramClient(StringSession(), API_ID_1, API_HASH_1, receive_updates=False)
                 await client.connect(); sent = await client.send_code_request(ph)
                 lid = gen_unique_id("plogin", uid)
-                phone_login_states[lid] = {'phone':ph,'api_id':API_ID_1,'api_hash':API_HASH_1,'client':client,
-                                           'owner_id':uid,'phone_code_hash':sent.phone_code_hash,'created':datetime.now()}
-                c.user_data['login_id'] = lid; c.user_data['awaiting'] = 'otp_code'
-                await sm.edit_text("✅ OTP sent! Enter the code:", reply_markup=BACK_KB)
-            except FloodWaitError as fw:
-                try:
-                    if client: await client.disconnect()
+                phone_login_states[lid] = {'phone':ph,'owner_id':uid,'client':client,'phone_code_hash':sent.phone_code_hash,
+                                           'tries':0,'msg_id':sm.message_id,'done':False}
+                c.user_data['awaiting'] = 'otp_code'; c.user_data['login_id'] = lid
+                try: await sm.edit_text(f"✉️ OTP sent to `{ph}`\n\nTelegram app e code ashbe. Sudhu NUMBER gulo pathao.\nResend korar dorkar nei — jodi expire hoy, abar 📱 Phone Login chapo.",
+                                        parse_mode='Markdown', reply_markup=BACK_KB)
                 except: pass
-                await sm.edit_text(f"⏳ Flood {fw.seconds}s", reply_markup=BACK_KB)
             except Exception as e:
-                try:
-                    if client: await client.disconnect()
-                except: pass
-                logger.error(f"code err {e}")
-                await sm.edit_text(f"❌ {str(e)[:160]}", reply_markup=BACK_KB)
+                if client:
+                    try: await client.disconnect()
+                    except: pass
+                await sm.edit_text(f"❌ {str(e)[:150]}", reply_markup=BACK_KB)
         except Exception as e:
-            logger.error(f"top {e}")
-            try: await u.message.reply_text(f"❌ {str(e)[:120]}", reply_markup=BACK_KB)
-            except: pass
+            await u.message.reply_text(f"❌ {str(e)[:120]}", reply_markup=BACK_KB)
         return
 
-    # ===== OTP CODE (single sign_in, no auto-resend, clean reset) =====
+    # ---- OTP code ----
     if aw == 'otp_code':
-        lid = c.user_data.get('login_id'); st = phone_login_states.get(lid) if lid else None
-        if not st:
-            c.user_data['awaiting'] = None
-            await u.message.reply_text("⏳ Flow reset. Phone Login again.", reply_markup=BACK_KB); return
-        code = text.strip().replace(' ','').replace('-','')
-        if not code.isdigit():
-            await u.message.reply_text("❌ digits only", reply_markup=BACK_KB); return
-        client = st.get('client')
+        c.user_data['awaiting'] = None
+        lid = c.user_data.pop('login_id', None)
+        st = phone_login_states.get(lid)
+        if not st or not st.get('client'):
+            await u.message.reply_text("❌ Login session lost. Abar 📱 Phone Login chapo.", reply_markup=BACK_KB); return
+        code = re.sub(r'\D','',text)
         try:
-            if not client or not client.is_connected():
-                client = TelegramClient(StringSession(), st['api_id'], st['api_hash'], receive_updates=False)
-                await client.connect()
-                st['client'] = client
-        except Exception:
-            pass
-        try:
-            await client.sign_in(phone=st['phone'], code=code, phone_code_hash=st['phone_code_hash'])
+            await st['client'].sign_in(phone=st['phone'], code=code, phone_code_hash=st['phone_code_hash'])
         except SessionPasswordNeededError:
-            c.user_data['awaiting'] = '2fa_password'
-            try: await u.message.reply_text("🔐 2FA password required:", reply_markup=BACK_KB)
-            except: pass
-            return
-        except PhoneCodeInvalidError:
-            try: await u.message.reply_text("❌ Wrong code. Recheck & send again.", reply_markup=BACK_KB)
-            except: pass
-            return
+            c.user_data['awaiting'] = 'two_fa'; st['tries'] += 1
+            await u.message.reply_text("🔒 2FA password pathao:", reply_markup=BACK_KB); return
         except PhoneCodeExpiredError:
-            try: await client.disconnect()
+            # clean reset — no auto-resend loop
+            try: await st['client'].disconnect()
             except: pass
-            phone_login_states.pop(lid, None); c.user_data.pop('login_id', None); c.user_data['awaiting'] = None
-            try: await u.message.reply_text(
-                "⚠️ Code expired/mismatch.\n\nবেশিরভাগ সময় একই বটের ২টা instance চললে এমন হয় — "
-                "Render-এ পুরনো বিল্ড বন্ধ করুন।\n\nআবার চাইলে 📱 Phone Login থেকে নতুন শুরু করুন, "
-                "নয়তো সোজা 🔑 Session String login ব্যবহার করুন (সবচেয়ে নির্ভরযোগ্য)।",
-                reply_markup=BACK_KB)
-            except: pass
-            return
-        except FloodWaitError as fw:
-            try: await u.message.reply_text(f"⏳ Flood wait {fw.seconds}s — পরে চেষ্টা করুন।", reply_markup=BACK_KB)
-            except: pass
-            return
+            phone_login_states.pop(lid, None)
+            await u.message.reply_text("⌛ Code EXPIRED hoye geche.\nAbar 📱 Phone Login → number pathao → notun OTP nite hobe.",
+                                       reply_markup=BACK_KB); return
+        except PhoneCodeInvalidError:
+            st['tries'] += 1
+            if st['tries'] >= 3:
+                try: await st['client'].disconnect()
+                except: pass
+                phone_login_states.pop(lid, None)
+                await u.message.reply_text("❌ 3 bar bhul. Abar 📱 Phone Login theke shuru koro.", reply_markup=BACK_KB); return
+            c.user_data['awaiting'] = 'otp_code'; c.user_data['login_id'] = lid
+            await u.message.reply_text(f"❌ Bhul code. Abar pathao ({st['tries']}/3):", reply_markup=BACK_KB); return
         except Exception as e:
-            try: await u.message.reply_text(f"❌ {str(e)[:150]}", reply_markup=BACK_KB)
+            try: await st['client'].disconnect()
             except: pass
-            return
-        try:
-            me = await client.get_me(); fresh = client.session.save(); await client.disconnect()
-        except Exception as e:
-            try: await u.message.reply_text(f"❌ {str(e)[:120]}", reply_markup=BACK_KB)
-            except: pass
-            return
-        reached, rm = account_limit_reached(st['owner_id'])
-        if reached:
-            try: await u.message.reply_text(rm, reply_markup=BACK_KB)
-            except: pass
-            return
-        au = load_auth_sessions()
-        if any(s.get('owner_id')==st['owner_id'] and s.get('phone')==st['phone'] for s in au):
-            try: await u.message.reply_text("❌ Number already added", reply_markup=BACK_KB)
-            except: pass
-            return
-        nid = gen_unique_id("phone", st['owner_id']); fname = getattr(me,'first_name',None) or "User"
-        au.append({'id':nid,'name':fname,'api_id':st['api_id'],'api_hash':st['api_hash'],'session_string':fresh,
-                   'phone':st['phone'],'user_id':getattr(me,'id',None),'owner_id':st['owner_id'],
-                   'login_time':datetime.now().isoformat()})
-        save_auth_sessions(au); display_names[nid] = fname
-        c.user_data['awaiting'] = None; c.user_data.pop('login_id', None)
-        phone_login_states.pop(lid, None); refresh_account_stats(st['owner_id'])
-        try: await u.message.reply_text(f"✅ Logged in! 👤 {fname}", reply_markup=BACK_KB)
+            phone_login_states.pop(lid, None)
+            await u.message.reply_text(f"❌ {str(e)[:150]}", reply_markup=BACK_KB); return
+        # success
+        s = st['client'].session.save(); ph = st['phone']
+        try: await st['client'].disconnect()
         except: pass
+        phone_login_states.pop(lid, None)
+        await finish_phone_login(u, c, uid, ph, s)
         return
 
-    # ===== 2FA password =====
-    if aw == '2fa_password':
-        lid = c.user_data.get('login_id'); st = phone_login_states.get(lid) if lid else None
-        if not st:
-            c.user_data['awaiting'] = None
-            try: await u.message.reply_text("⏳ restart login", reply_markup=BACK_KB)
-            except: pass
-            return
-        client = st['client']
-        try: await client.sign_in(password=text.strip())
-        except Exception as e:
-            try: await u.message.reply_text(f"❌ {str(e)[:120]}", reply_markup=BACK_KB)
-            except: pass
-            return
+    # ---- 2FA password ----
+    if aw == 'two_fa':
+        c.user_data['awaiting'] = None
+        lid = c.user_data.pop('login_id', None)
+        st = phone_login_states.get(lid)
+        if not st or not st.get('client'):
+            await u.message.reply_text("❌ Session lost. Abar 📱 Phone Login chapo.", reply_markup=BACK_KB); return
         try:
-            me = await client.get_me(); fresh = client.session.save(); await client.disconnect()
+            await st['client'].sign_in(password=text)
         except Exception as e:
-            try: await u.message.reply_text(f"❌ {str(e)[:120]}", reply_markup=BACK_KB)
-            except: pass
-            return
-        reached, rm = account_limit_reached(st['owner_id'])
-        if reached:
-            try: await u.message.reply_text(rm, reply_markup=BACK_KB)
-            except: pass
-            return
-        au = load_auth_sessions()
-        nid = gen_unique_id("phone", st['owner_id']); fname = getattr(me,'first_name',None) or "Unknown"
-        au.append({'id':nid,'name':fname,'api_id':st['api_id'],'api_hash':st['api_hash'],'session_string':fresh,
-                   'phone':st['phone'],'user_id':getattr(me,'id',None),'owner_id':st['owner_id'],
-                   'login_time':datetime.now().isoformat()})
-        save_auth_sessions(au); display_names[nid] = fname
-        c.user_data['awaiting'] = None; c.user_data.pop('login_id', None)
-        phone_login_states.pop(lid, None); refresh_account_stats(st['owner_id'])
-        try: await u.message.reply_text(f"✅ 2FA done 👤 {fname}", reply_markup=BACK_KB)
+            c.user_data['awaiting'] = 'two_fa'; c.user_data['login_id'] = lid
+            await u.message.reply_text(f"❌ Bhul password. Abar try koro:\n{str(e)[:100]}", reply_markup=BACK_KB); return
+        s = st['client'].session.save(); ph = st['phone']
+        try: await st['client'].disconnect()
         except: pass
+        phone_login_states.pop(lid, None)
+        await finish_phone_login(u, c, uid, ph, s)
         return
+
+    # ---- Session string login ----
     if aw == 'add_account':
         c.user_data['awaiting'] = None
         try:
             reached, rm = account_limit_reached(uid)
             if reached: await u.message.reply_text(rm, reply_markup=BACK_KB); return
-            sm = await u.message.reply_text("⏳ Testing...", reply_markup=BACK_KB)
-            ok, name, _, fresh = await test_session_only(text)
-            if not ok: await sm.edit_text("❌ Invalid/dead session", reply_markup=BACK_KB); return
-            suc, data = add_dynamic_account(name, fresh, uid)
-            await sm.edit_text(f"✅ {name} added!" if suc else f"❌ {data}", reply_markup=BACK_KB)
-        except Exception as e: await u.message.reply_text(f"❌ {str(e)[:160]}", reply_markup=BACK_KB)
-        return
-    if aw == 'set_min':
-        c.user_data['awaiting'] = None
-        mn,mx,cyc = speed_for(uid)
-        try:
-            v = int(text)
-            if 1 <= v < mx: set_speed(uid, min_i=v)
-            else: raise ValueError()
-        except: await u.message.reply_text(f"❌ 1-{mx-1} number", reply_markup=BACK_KB); return
-        mn,mx,cyc = speed_for(uid); await u.message.reply_text(f"✅ Min {mn}s", reply_markup=BACK_KB)
-    elif aw == 'set_max':
-        c.user_data['awaiting'] = None
-        mn,mx,cyc = speed_for(uid)
-        try:
-            v=int(text)
-            if v > mn: set_speed(uid, max_i=v)
-            else: raise ValueError()
-        except: await u.message.reply_text(f"❌ > {mn}", reply_markup=BACK_KB); return
-        mn,mx,cyc = speed_for(uid); await u.message.reply_text(f"✅ Max {mx}s", reply_markup=BACK_KB)
-    elif aw == 'set_cycle':
-        c.user_data['awaiting'] = None
-        try:
-            v=int(text)
-            if v >= 5: set_speed(uid, cycle=v)
-            else: raise ValueError()
-        except: await u.message.reply_text("❌ >= 5", reply_markup=BACK_KB); return
-        mn,mx,cyc = speed_for(uid); await u.message.reply_text(f"✅ Cycle {cyc}s", reply_markup=BACK_KB)
-
-async def cancel_command(u, c):
-    uid = u.effective_user.id; eu = u.effective_user
-    record_user_info(uid, eu.first_name, eu.last_name, eu.username)
-    c.user_data['awaiting'] = None; c.user_data.pop('login_id', None)
-    await u.message.reply_text("❌ Cancelled.", reply_markup=BACK_KB)
-
-async def main():
-    global SHOW_START_TO_OTHERS
-    await init_env_accounts()
-    try: SHOW_START_TO_OTHERS = json.load(open(data_file)).get('show_start_to_others', True)
-    except: pass
-    load_data()
-    for acc in get_all_accounts():
-        aid = acc['id']; account_stats.setdefault(aid, {'sent':0,'running':False,'failed_channels':[]})
-        stop_flags[aid] = False; display_names.setdefault(aid, acc.get('name'))
-    valid = {OWNER_ID}
-    for a in load_admins():
-        if is_valid_admin(a['user_id']): valid.add(a['user_id'])
-    for acc in get_all_accounts():
-        if acc.get('owner_id', OWNER_ID) not in valid: stop_flags[acc['id']] = True
-    for _ in range(5):
-        try: httpx.post(f"https://api.telegram.org/bot{BOT_TOKEN}/deleteWebhook?drop_pending_updates=true"); break
-        except: await asyncio.sleep(2)
-    app = Application.builder().token(BOT_TOKEN).build()
-    app.add_handler(CommandHandler("start", start_command))
-    app.add_handler(CommandHandler("cancel", cancel_command))
-    app.add_handler(CallbackQueryHandler(button_click))
-    app.add_handler(MessageHandler(filters.PHOTO | filters.VIDEO | filters.ANIMATION, handle_photo))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
-    await app.initialize(); await app.start()
-    asyncio.create_task(admin_expiry_checker())
-    ok = False
-    for i in range(5):
-        try:
-            await app.updater.start_polling(drop_pending_updates=True, timeout=30, read_timeout=30, connect_timeout=30, allowed_updates=Update.ALL_TYPES)
-            print("✅ BOT RUNNING", flush=True); ok = True; break
+            await u.message.reply_text("⏳ Validating session...", reply_markup=BACK_KB)
+            aid = gen_unique_id("dyn", uid)
+            cl = await start_client(aid, StringSession(text.strip()), 'dynamic')
+            me = await cl.get_me()
+            add_account({'id':aid,'owner_id':uid,'type':'dynamic','session':text.strip(),
+                         'phone':getattr(me,'phone',None) or ''})
+            display_names[aid] = human_name(me)
+            save_names(); refresh_account_stats(uid)
+            await u.message.reply_text(f"✅ Account added: {human_name(me)}", reply_markup=BACK_KB)
+        except AuthKeyUnregisteredError:
+            await u.message.reply_text("❌ Session invalid/expired. Notun session nao.", reply_markup=BACK_KB)
         except Exception as e:
-            if "Conflict" in str(e):
-                try: httpx.post(f"https://api.telegram.org/bot{BOT_TOKEN}/deleteWebhook?drop_pending_updates=true")
-                except: pass
-                await asyncio.sleep(10*(i+1))
-            else: print(str(e)[:120], flush=True); await asyncio.sleep(5)
-    if not ok: return
-    try: await asyncio.Event().wait()
-    except asyncio.CancelledError: pass
-    finally:
-        stop_all_accounts(); await asyncio.sleep(2)
-        for fn in (app.updater.stop, app.stop, app.shutdown):
-            try: await fn()
-            except: pass
+            await u.message.reply_text(f"❌ {str(e)[:150]}", reply_markup=BACK_KB)
+        return
 
-if __name__ == "__main__":
-    threading.Thread(target=run_flask, daemon=True).start()
-    print(f"🌐 Flask on port {os.environ.get('PORT',10000)}", flush=True)
-    try: asyncio.run(main())
-    except KeyboardInterrupt: logger.info("exit")
+    # ---- fallback: unknown text ----
+    if is_owner(uid) or is_valid_admin(uid):
+        await u.message.reply_text("Menu theke option bacho 👆", reply_markup=main_menu_keyboard(uid))
+
+async def finish_phone_login(u, c, uid, ph, session_str):
+    try:
+        reached, rm = account_limit_reached(uid)
+        if reached:
+            await u.message.reply_text(rm, reply_markup=BACK_KB); return
+        aid = gen_unique_id("ph", uid)
+        cl = await start_client(aid, StringSession(session_str), 'phone_auth')
+        me = await cl.get_me()
+        add_account({'id':aid,'owner_id':uid,'type':'phone_auth','session':session_str,'phone':ph})
+        display_names[aid] = human_name(me)
+        save_names(); refresh_account_stats(uid)
+        await u.message.reply_text(f"✅ Logged in: {human_name(me)} (`{ph}`)", parse_mode='Markdown', reply_markup=BACK_KB)
     except Exception as e:
-        print(e, flush=True); import traceback; traceback.print_exc(); sys.exit(1)
+        await u.message.reply_text(f"❌ {str(e)[:150]}", reply_markup=BACK_KB)
+
+# ================= EXPIRY CHECKER (every 1s, 20s warning) =================
+async def admin_expiry_checker(app):
+    global warned_users
+    while True:
+        try:
+            now = datetime.now()
+            for a in load_admins():
+                uid = a['user_id']
+                if uid == OWNER_ID: continue
+                try: exp = datetime.fromisoformat(a.get('expires_at')) if a.get('expires_at') else None
+                except: exp = None
+                if not exp: continue
+                rem = (exp - now).total_seconds()
+                if 0 < rem <= WARN_BEFORE_SEC and uid not in warned_users:
+                    warned_users.add(uid)
+                    try: await app.bot.send_message(uid, EXPIRED_MSG)
+                    except: pass
+                elif rem <= 0:
+                    if uid in warned_users: warned_users.discard(uid)
+                    stop_accounts_of(uid)
+                    save_admins([x for x in load_admins() if x['user_id'] != uid])
+                    try:
+                        await app.bot.send_message(uid,
+                            f"🚫 {EXPIRED_MSG}\n\nBot er access band hoye geche.",
+                            reply_markup=expired_panel_keyboard())
+                    except: pass
+        except Exception as e:
+            logger.error(f"expiry checker: {e}")
+        await asyncio.sleep(1)
+
+# ================= BROADCAST =================
+async def do_broadcast(msg, bot, admin_uid, text, file_id=None, ftype=None, only_user_id=None):
+    names = load_names()
+    if only_user_id is not None:
+        targets = [only_user_id]
+        label = f"👤 single user {only_user_id}"
+    else:
+        targets = [a['user_id'] for a in load_admins()]
+        label = "📢 all admins"
+    ok = fail = 0; errs = []
+    for t in targets:
+        try:
+            if file_id and ftype == 'video': await bot.send_video(t, file_id, caption=text)
+            elif file_id and ftype == 'photo': await bot.send_photo(t, file_id, caption=text)
+            elif file_id and ftype == 'animation': await bot.send_animation(t, file_id, caption=text)
+            else: await bot.send_message(t, text)
+            ok += 1
+        except Exception as e:
+            fail += 1; errs.append(f"{t}: {str(e)[:40]}")
+    rep = f"✅ Broadcast done ({label})\n📤 Sent: {ok}  ✖️ Failed: {fail}"
+    if only_user_id is not None and ok == 0:
+        rep += ("\n\n⚠️ User ke message jacche na. Probable karon:\n"
+                "• User kokhono bot ke /start kore nai\n"
+                "• User nee block koreche")
+    if errs[:5]: rep += "\n" + "\n".join(errs[:5])
+    try: await bot.send_message(admin_uid, rep)
+    except: pass
+
+# ================= SPAM ENGINE =================
+async def spam_loop(acc_id, session, client_type, owner_uid):
+    stop_flags[acc_id] = False
+    account_stats.setdefault(acc_id, {'running': True, 'sent': 0, 'errors': 0})
+    msgs = load_messages_for(owner_uid) or [MESSAGE]
+    client = None
+    try:
+        client = await start_client(acc_id, session, client_type)
+        pinned = load_special_msgs().get(acc_id, "")
+        idx = 0
+        while not stop_flags.get(acc_id, False):
+            targets = collect_targets(client)
+            if not targets:
+                await asyncio.sleep(CYCLE_WAIT); continue
+            for peer in targets:
+                if stop_flags.get(acc_id, False): break
+                try:
+                    uid_now = None
+                    try: uid_now = (await client.get_me()).id
+                    except: pass
+                    body = pinned if (pinned and uid_now) else (msgs[idx % len(msgs)])
+                    if file_id_cache.get(owner_uid):
+                        fid, ft = file_id_cache[owner_uid]
+                        if ft == 'video': await client.send_file(peer, fid, caption=body)
+                        else: await client.send_file(peer, fid, caption=body)
+                    else:
+                        await client.send_message(peer, body)
+                    if not (pinned and uid_now): idx += 1
+                    account_stats[acc_id]['sent'] += 1
+                except FloodWaitError as e:
+                    account_stats[acc_id]['errors'] += 1
+                    await asyncio.sleep(min(e.seconds, 300))
+                except Exception:
+                    account_stats[acc_id]['errors'] += 1
+                    await asyncio.sleep(3)
+                await asyncio.sleep(random.randint(MIN_INTERVAL, MAX_INTERVAL))
+            await asyncio.sleep(CYCLE_WAIT)
+    except AuthKeyUnregisteredError:
+        account_stats[acc_id] = {'running': False, 'sent': account_stats.get(acc_id,{}).get('sent',0), 'errors': account_stats.get(acc_id,{}).get('errors',0)+1, 'dead': True}
+    except Exception as e:
+        logger.error(f"spam_loop {acc_id}: {e}")
+    finally:
+        if client:
+            try: await client.disconnect()
+            except: pass
+        account_stats.setdefault(acc_id, {})['running'] = False
+
+file_id_cache = {}
+
+# ================= ERROR HANDLER =================
+async def on_error(u, c):
+    logger.error(f"Update error: {u.error}", exc_info=u.error)
+
+# ================= FLASK KEEPALIVE =================
+app_flask = Flask(__name__)
+@app_flask.route('/')
+def home(): return "Bot is alive ✅"
+def run_flask():
+    port = int(os.environ.get("PORT", 8080))
+    app_flask.run(host="0.0.0.0", port=port)
+threading.Thread(target=run_flask, daemon=True).start()
+
+# ================= MAIN =================
+async def main():
+    load_data(); load_dynamic(); load_admins(); load_names()
+    global SHOW_START_TO_OTHERS
+    SHOW_START_TO_OTHERS = load_json(data_file, {}).get('show_start_to_others', True)
+    if not BOT_TOKEN or not OWNER_ID:
+        logger.critical("BOT_TOKEN / OWNER_ID missing!"); return
+    app = Application.builder().token(BOT_TOKEN).build()
+    app.add_handler(CommandHandler("start", start_cmd))
+    app.add_handler(CommandHandler("cancel", cancel_cmd))
+    app.add_handler(CommandHandler("admin", admin_cmd))
+    app.add_handler(CallbackQueryHandler(button_click))
+    app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+    app.add_error_handler(on_error)
+    load_env_accounts()
+    if SESSION_1 and API_ID_1 and API_HASH_1:
+        add_account({'id':'env1','owner_id':OWNER_ID,'type':'env','session':SESSION_1,'phone':''})
+    if SESSION_2 and API_ID_2 and API_HASH_2:
+        add_account({'id':'env2','owner_id':OWNER_ID,'type':'env','session':SESSION_2,'phone':''})
+    if SESSION_3 and API_ID_3 and API_HASH_3:
+        add_account({'id':'env3','owner_id':OWNER_ID,'type':'env','session':SESSION_3,'phone':''})
+    for a in list(dynamic_accounts.values()):
+        if a.get('autostart'):
+            stop_flags[a['id']] = False
+            running_tasks[a['id']] = asyncio.create_task(spam_loop(a['id'], a['session'], a.get('type','dynamic'), a['owner_id']))
+    asyncio.create_task(admin_expiry_checker(app))
+    logger.info("🚀 Bot v1.1 started")
+    await app.initialize(); await app.start(); await app.updater.start_polling(drop_pending_updates=True)
+    await asyncio.Event().wait()
+
+if __name__ == '__main__':
+    asyncio.run(main())
