@@ -1,13 +1,12 @@
 #!/usr/bin/env python3
 """
-Telegram Mass Messaging Bot v1.3 FINAL
-- Call Nobody + Photo/Bio Everybody (Privacy fixed)
-- Name Changer (removes old first+last, adds new)
-- Channel & Request Groups Join Fixed
-- Apply profile to single account or all
-- Super Fast Speed (up to 5 msg/sec)
-- Fixed Profile Config freeze bug
-- Multiple Logos upload support (no overwrite)
+Telegram Mass Messaging Bot v1.4 FINAL
+- Shared Folder Link Join (addlist support)
+- Fixed Profile Photo upload delay & verify
+- Fixed Session Add message edit & error handling
+- Call Nobody + Photo/Bio Everybody (Privacy)
+- Name Changer (First+Last removed)
+- Super Fast Speed (5 msg/sec)
 - Auto logout on admin expiry
 """
 import sys, os, asyncio, random, logging, json, threading, re, uuid
@@ -17,6 +16,7 @@ from telethon.sessions import StringSession
 from telethon.tl.functions.account import UpdateProfileRequest, SetPrivacyRequest
 from telethon.tl.functions.photos import UploadProfilePhotoRequest, GetUserPhotosRequest, DeletePhotosRequest
 from telethon.tl.functions.messages import GetDialogsRequest
+from telethon.tl.functions.chatlists import CheckChatlistInviteRequest
 from telethon.tl.types import (
     InputPeerEmpty, InputPrivacyKeyPhoneCall, InputPrivacyValueDisallowAll,
     InputPrivacyKeyProfilePhoto, InputPrivacyKeyAbout, InputPrivacyValueAllowAll,
@@ -393,7 +393,26 @@ async def join_link(client, link):
     link = link.strip().replace('http://', 'https://')
     if not link: raise ValueError("empty link")
     
-    # Private invite link (t.me/+xyz or t.me/joinchat/xyz)
+    # 1. Shared Folder Link Support
+    if 't.me/addlist/' in link:
+        m = re.search(r'addlist/([A-Za-z0-9_-]+)', link)
+        if not m: raise ValueError("invalid folder link")
+        slug = m.group(1)
+        try:
+            res = await client(CheckChatlistInviteRequest(slug=slug))
+            joined_count = 0
+            for peer in res.peers:
+                try:
+                    await client(functions.channels.JoinChannelRequest(peer))
+                    joined_count += 1
+                    await asyncio.sleep(1.5)
+                except Exception:
+                    pass
+            return f"Joined {joined_count} from folder"
+        except Exception as e:
+            raise ValueError(f"Folder join failed: {str(e)[:30]}")
+
+    # 2. Private Invite Link
     if 't.me/+' in link or 'joinchat' in link:
         m = re.search(r'(?:t\.me/\+|joinchat/)([A-Za-z0-9_-]+)', link)
         if not m: raise ValueError("bad invite link")
@@ -409,15 +428,13 @@ async def join_link(client, link):
                 return "Request sent"
             raise
 
-    # Public username or folder link
+    # 3. Public Username/Channel
     m = re.search(r'(?:t\.me/|telegram\.me/|@)([A-Za-z0-9_]+)', link)
     if not m: raise ValueError("bad link")
     username = m.group(1)
     
     try:
         entity = await client.get_entity(username)
-        if hasattr(entity, 'folder_id') or (hasattr(entity, 'title') and 'folder' in str(type(entity)).lower()):
-            return "Folder detected, not joinable"
         await client(functions.channels.JoinChannelRequest(entity))
         return "Joined channel"
     except errors.InviteRequestSentError:
@@ -438,35 +455,20 @@ async def join_link(client, link):
 
 async def set_privacy_all(client):
     results = []
-    # 1. Call Nobody
     try:
-        await client(SetPrivacyRequest(
-            key=InputPrivacyKeyPhoneCall(),
-            rules=[InputPrivacyValueDisallowAll()]
-        ))
+        await client(SetPrivacyRequest(key=InputPrivacyKeyPhoneCall(), rules=[InputPrivacyValueDisallowAll()]))
         results.append("✅ Call Nobody")
-    except Exception as e:
-        results.append(f"❌ Call: {str(e)[:30]}")
+    except Exception as e: results.append(f"❌ Call: {str(e)[:30]}")
 
-    # 2. Profile Photo Everybody
     try:
-        await client(SetPrivacyRequest(
-            key=InputPrivacyKeyProfilePhoto(),
-            rules=[InputPrivacyValueAllowAll()]
-        ))
+        await client(SetPrivacyRequest(key=InputPrivacyKeyProfilePhoto(), rules=[InputPrivacyValueAllowAll()]))
         results.append("✅ Photo Everybody")
-    except Exception as e:
-        results.append(f"❌ Photo privacy: {str(e)[:30]}")
+    except Exception as e: results.append(f"❌ Photo privacy: {str(e)[:30]}")
 
-    # 3. Bio Everybody
     try:
-        await client(SetPrivacyRequest(
-            key=InputPrivacyKeyAbout(),
-            rules=[InputPrivacyValueAllowAll()]
-        ))
+        await client(SetPrivacyRequest(key=InputPrivacyKeyAbout(), rules=[InputPrivacyValueAllowAll()]))
         results.append("✅ Bio Everybody")
-    except Exception as e:
-        results.append(f"❌ Bio privacy: {str(e)[:30]}")
+    except Exception as e: results.append(f"❌ Bio privacy: {str(e)[:30]}")
 
     return results
 
@@ -474,7 +476,7 @@ async def apply_profile(acc, name, photos, bio, channels, bot=None):
     r = []; aid = acc['id']; client = await get_client(acc)
     if not client.is_user_authorized(): return ["❌ Session is dead!"]
     
-    # 1. Name Change (First + Last remove, set new)
+    # 1. Name Change
     if name:
         try:
             await client(UpdateProfileRequest(first_name=name, last_name=""))
@@ -493,18 +495,13 @@ async def apply_profile(acc, name, photos, bio, channels, bot=None):
     if photos:
         try:
             me = await client.get_me()
-            existing = await client(GetUserPhotosRequest(
-                user_id=me, offset=0, max_id=0, limit=100
-            ))
+            existing = await client(GetUserPhotosRequest(user_id=me, offset=0, max_id=0, limit=100))
             if existing.photos:
-                input_photos = [
-                    InputPhoto(id=p.id, access_hash=p.access_hash, file_reference=p.file_reference)
-                    for p in existing.photos
-                ]
+                input_photos = [InputPhoto(id=p.id, access_hash=p.access_hash, file_reference=p.file_reference) for p in existing.photos]
                 await client(DeletePhotosRequest(id=input_photos))
-        except Exception:
-            pass
+        except Exception: pass
 
+        uploaded = 0
         for idx, photo in enumerate(photos):
             p = None
             try:
@@ -514,25 +511,38 @@ async def apply_profile(acc, name, photos, bio, channels, bot=None):
                 with open(p, 'rb') as fh:
                     up = await client.upload_file(fh)
                 await client(UploadProfilePhotoRequest(file=up))
-                r.append(f"✅ Photo {idx+1}")
+                uploaded += 1
+                await asyncio.sleep(2) # Delay for processing
             except Exception as e:
-                r.append(f"❌ Photo {idx+1}: {str(e)[:40]}")
+                r.append(f"❌ Photo {idx+1}: {str(e)[:30]}")
             finally:
                 if p and os.path.exists(p):
                     try: os.remove(p)
                     except Exception: pass
-            await asyncio.sleep(1.5)
+            
+        # Verify photos
+        if uploaded > 0:
+            await asyncio.sleep(2)
+            try:
+                me = await client.get_me()
+                final = await client(GetUserPhotosRequest(user_id=me, offset=0, max_id=0, limit=100))
+                if final.photos:
+                    r.append(f"✅ {len(final.photos)} Photo(s) active")
+                else:
+                    r.append("⚠️ Photo uploaded but not visible yet")
+            except Exception:
+                r.append(f"✅ {uploaded} Photo(s) uploaded")
 
     # 4. Channels & Folders Join
     for lk in channels:
         try:
             status = await join_link(client, lk)
-            r.append(f"✅ {status} ({lk[:20]})")
+            r.append(f"✅ {status} ({lk[:15]})")
         except Exception as e:
             r.append(f"❌ {lk[:15]}: {str(e)[:30]}")
         await asyncio.sleep(1.5)
 
-    # 5. Privacy: Call Nobody, Photo/Bio Everybody
+    # 5. Privacy
     priv_results = await set_privacy_all(client)
     r.extend(priv_results)
         
@@ -561,10 +571,7 @@ async def run_account_messaging(acc, owner):
                 stop_account(aid); return
             mn, mx, cyc = speed_for(owner)
             random.shuffle(groups)
-            
-            # SUPER FAST SPEED
             is_fast = (mn == 0 and mx == 0)
-            
             for g in groups:
                 if stop_flags.get(aid, False): break
                 if g.id in failed: continue
@@ -589,10 +596,8 @@ async def run_account_messaging(acc, owner):
                     if any(x in str(e).lower() for x in ['ban','restrict','forbidden','admin',"can't write"]):
                         failed.add(g.id)
                 
-                if is_fast:
-                    await asyncio.sleep(0.2)
-                else:
-                    await asyncio.sleep(random.randint(mn, mx))
+                if is_fast: await asyncio.sleep(0.2)
+                else: await asyncio.sleep(random.randint(mn, mx))
                     
             res, _ = await is_account_restricted(client)
             if res:
@@ -640,15 +645,17 @@ async def admin_expiry_checker():
                 if not exp: keep.append(a); continue
                 try: rem = (datetime.fromisoformat(exp) - datetime.now()).total_seconds()
                 except Exception: rem = 999999
+                
                 if rem <= 0:
                     changed = True
                     for acc in get_all_accounts(uid):
-                        if account_stats.get(acc['id'], {}).get('running', False): stop_account(acc['id'])
+                        if account_stats.get(acc['id'], {}).get('running', False): 
+                            stop_account(acc['id'])
                         await disconnect_client(acc['id'])
-                        # AUTO LOGOUT ON EXPIRY
                         try:
                             c = await get_client(acc)
-                            await c.log_out()
+                            if c.is_connected() and c.is_user_authorized():
+                                await c.log_out()
                         except Exception: pass
                     try: await notify_plain(uid, f"⛔ Plan expired\n\n{EXPIRED_MSG}")
                     except Exception: pass
@@ -707,7 +714,7 @@ def main_menu_text(u):
         cap = admin_max_accounts(u); cur = owner_acc_count(u)
         lim = f"\n🔢 Accounts: {cur}" if cap is None else f"\n🔢 Accounts: {cur}/{cap}"
         extra = exp + lim
-    return (f"✨ *Bot v1.3 FINAL* ✨\n{role}{extra}\n\n"
+    return (f"✨ *Bot v1.4 FINAL* ✨\n{role}{extra}\n\n"
             f"📊 Accounts: {len(accs)} (Running: {run})\n"
             f"⚡ Speed: {mn}-{mx}s | 🔄 Cycle: {cyc}s\n📨 Sent: {sent}")
 
@@ -1454,7 +1461,7 @@ async def handle_text(u, c):
             set_speed(uid, cycle=v)
         await u.message.reply_text(f"✅ Speed updated: {speed_for(uid)}", reply_markup=BACK_KB); return
 
-    # =============== PHONE LOGIN (MARKDOWN-SAFE: plain text only) ===============
+    # =============== PHONE LOGIN ===============
     if aw == 'phone_number':
         c.user_data['awaiting'] = None
         try:
@@ -1557,24 +1564,30 @@ async def handle_text(u, c):
         try:
             reached, rm = account_limit_reached(uid)
             if reached: await u.message.reply_text(rm, reply_markup=BACK_KB); return
-            await u.message.reply_text("⏳ Validating session...", reply_markup=BACK_KB)
+            
+            sm = await u.message.reply_text("⏳ Validating session...", reply_markup=BACK_KB)
+            
             if not API_ID_1 or not API_HASH_1:
-                await u.message.reply_text("❌ API keys missing!", reply_markup=BACK_KB); return
+                await sm.edit_text("❌ API keys missing!", reply_markup=BACK_KB); return
+                
             tmp = TelegramClient(StringSession(text.strip()), API_ID_1, API_HASH_1, receive_updates=False)
             await tmp.start(); me = await tmp.get_me(); sstr = tmp.session.save(); await tmp.disconnect()
             ok, nid = add_dynamic_account(human_name(me), sstr, uid)
-            if not ok: await u.message.reply_text("❌ Already exists", reply_markup=BACK_KB); return
+            if not ok: 
+                await sm.edit_text("❌ Already exists", reply_markup=BACK_KB); return
+                
             save_names(); refresh_account_stats(uid)
-            await u.message.reply_text(f"✅ Account added: {human_name(me)}", reply_markup=BACK_KB)
+            await sm.edit_text(f"✅ Account added: {human_name(me)}", reply_markup=BACK_KB)
+            
         except AuthKeyUnregisteredError:
-            await u.message.reply_text("❌ Session invalid/expired.", reply_markup=BACK_KB)
+            await sm.edit_text("❌ Session invalid/expired.", reply_markup=BACK_KB)
         except Exception as e:
-            await u.message.reply_text(f"❌ {str(e)[:150]}", reply_markup=BACK_KB)
+            await sm.edit_text(f"❌ {str(e)[:150]}", reply_markup=BACK_KB)
         return
     if is_owner(uid) or is_valid_admin(uid):
         await u.message.reply_text("Menu theke option bacho 👆", reply_markup=main_menu_keyboard(uid))
 
-# =============== PHONE LOGIN SUCCESS (plain text, no Markdown) ===============
+# =============== PHONE LOGIN SUCCESS ===============
 async def finish_phone_login(u, c, uid, ph, session_str):
     try:
         reached, rm = account_limit_reached(uid)
@@ -1637,7 +1650,7 @@ async def main():
     logger.info("Bot starting (polling)...")
     await app.initialize(); await app.start()
     await app.updater.start_polling(drop_pending_updates=True)
-    logger.info("Bot v1.3 running")
+    logger.info("Bot v1.4 running")
     await asyncio.Event().wait()
 
 if __name__ == '__main__':
