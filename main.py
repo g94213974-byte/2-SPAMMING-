@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
 """
-Telegram Mass Messaging Bot v1.5 FINAL
-- Fixed Account count (0/1 bug) and Delete menu (type mismatch fixed)
-- Fixed Session & OTP Login live UI update (edit message)
+Telegram Mass Messaging Bot v1.6 FINAL
+- Fixed Account count 0 bug (Force cache clear & type casting)
+- Fixed Profile Photo upload (Added DocumentAttributeFilename)
 - Shared Folder Link Join (addlist support)
-- Fixed Profile Photo upload delay & verify
 - Call Nobody + Photo/Bio Everybody (Privacy)
 - Name Changer (First+Last removed)
 - Super Fast Speed (5 msg/sec)
@@ -21,7 +20,7 @@ from telethon.tl.functions.chatlists import CheckChatlistInviteRequest
 from telethon.tl.types import (
     InputPeerEmpty, InputPrivacyKeyPhoneCall, InputPrivacyValueDisallowAll,
     InputPrivacyKeyProfilePhoto, InputPrivacyKeyAbout, InputPrivacyValueAllowAll,
-    InputPhoto
+    InputPhoto, DocumentAttributeFilename
 )
 from telethon.errors import (FloodWaitError, SessionPasswordNeededError,
     PhoneCodeInvalidError, PhoneCodeExpiredError, UserRestrictedError,
@@ -249,7 +248,7 @@ def add_dynamic_account(name, ss, owner_id):
         if a['session'] == ss: return False, "Session already exists!"
     nid = gen_unique_id("acc_dyn", owner_id)
     accs.append({'id': nid, 'name': name, 'api_id': API_ID_1, 'api_hash': API_HASH_1,
-                 'session': ss, 'type': 'dynamic', 'owner_id': int(owner_id)}) # force int
+                 'session': ss, 'type': 'dynamic', 'owner_id': int(owner_id)})
     save_dynamic_accounts(accs); display_names[nid] = name
     return True, nid
 
@@ -257,22 +256,39 @@ def add_phone_auth_account(name, ss, owner_id, phone):
     aus = load_auth_sessions()
     nid = gen_unique_id("ph", owner_id)
     aus.append({'id': nid, 'name': name, 'api_id': API_ID_1, 'api_hash': API_HASH_1,
-                'session_string': ss, 'type': 'phone_auth', 'phone': phone, 'owner_id': int(owner_id)}) # force int
+                'session_string': ss, 'type': 'phone_auth', 'phone': phone, 'owner_id': int(owner_id)})
     save_auth_sessions(aus); display_names[nid] = name
     return nid
 
 def get_all_accounts(user_id=None):
+    # FIX: Force fresh read from files to prevent cache 0 bug
     dyn = load_dynamic_accounts()
-    auth = [{'id': s['id'], 'name': s.get('name', f"User_{s.get('owner_id','?')}"),
-             'api_id': s['api_id'], 'api_hash': s['api_hash'], 'session': s['session_string'],
-             'type': 'phone_auth', 'phone': s.get('phone', ''), 'owner_id': int(s.get('owner_id', OWNER_ID))}
-            for s in load_auth_sessions()]
-            
+    auth = load_auth_sessions()
+    
+    accs = []
+    for a in ENV_ACCOUNTS: 
+        accs.append(a)
+        
     for d in dyn:
         d['owner_id'] = int(d.get('owner_id', OWNER_ID))
-
-    accs = ENV_ACCOUNTS + dyn + auth
-    if user_id is None or int(user_id) == OWNER_ID: return accs
+        d['session'] = d.get('session') or d.get('session_string')
+        accs.append(d)
+        
+    for s in auth:
+        accs.append({
+            'id': s['id'], 
+            'name': s.get('name', f"User_{s.get('owner_id','?')}"),
+            'api_id': s['api_id'], 
+            'api_hash': s['api_hash'], 
+            'session': s['session_string'],
+            'type': 'phone_auth', 
+            'phone': s.get('phone', ''), 
+            'owner_id': int(s.get('owner_id', OWNER_ID))
+        })
+        
+    if user_id is None or int(user_id) == OWNER_ID: 
+        return accs
+        
     return [a for a in accs if a.get('owner_id') == int(user_id)]
 
 def remove_account_by_id(aid):
@@ -333,6 +349,7 @@ def refresh_account_stats(user_id=None):
         aid = a['id']
         if aid not in account_stats:
             account_stats[aid] = {'sent': 0, 'running': False}
+        if aid not in stop_flags:
             stop_flags[aid] = False
 
 # ---------------- telethon core ----------------
@@ -508,7 +525,8 @@ async def apply_profile(acc, name, photos, bio, channels, bot=None):
                 p = f"prof_{aid}_{idx}.jpg"
                 await tf.download_to_drive(custom_path=p)
                 with open(p, 'rb') as fh:
-                    up = await client.upload_file(fh)
+                    # FIX: Added attributes
+                    up = await client.upload_file(fh, attributes=[DocumentAttributeFilename(file_name=f"{aid}_{idx}.jpg")])
                 await client(UploadProfilePhotoRequest(file=up))
                 uploaded += 1
                 await asyncio.sleep(2) 
@@ -710,7 +728,7 @@ def main_menu_text(u):
         cap = admin_max_accounts(u); cur = owner_acc_count(u)
         lim = f"\n🔢 Accounts: {cur}" if cap is None else f"\n🔢 Accounts: {cur}/{cap}"
         extra = exp + lim
-    return (f"✨ *Bot v1.5 FINAL* ✨\n{role}{extra}\n\n"
+    return (f"✨ *Bot v1.6 FINAL* ✨\n{role}{extra}\n\n"
             f"📊 Accounts: {len(accs)} (Running: {run})\n"
             f"⚡ Speed: {mn}-{mx}s | 🔄 Cycle: {cyc}s\n📨 Sent: {sent}")
 
@@ -1655,7 +1673,7 @@ async def main():
     logger.info("Bot starting (polling)...")
     await app.initialize(); await app.start()
     await app.updater.start_polling(drop_pending_updates=True)
-    logger.info("Bot v1.5 running")
+    logger.info("Bot v1.6 running")
     await asyncio.Event().wait()
 
 if __name__ == '__main__':
