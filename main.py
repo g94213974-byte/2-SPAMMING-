@@ -1,21 +1,23 @@
 #!/usr/bin/env python3
 """
-Telegram Mass Messaging Bot v1.1 FINAL (CLEAN MERGE, referral removed, OTP markdown-safe)
-- Per-account SPECIAL MESSAGE
-- Phone OTP login (single sign_in, no auto-resend loop) - Markdown-safe
-- Auto-remove expired admins + 20s pre-expiry warning
-- Owner custom admin time (+ add / - subtract / = set), 1s..any
-- Targeted broadcast to a single user with error reporting
-- Buy panel + QR payment screenshot -> owner Accept/Reject/Block
+Telegram Mass Messaging Bot v1.2 FINAL
+- Call Nobody + Photo/Bio Everybody profile setup
+- Name Changer (removes old first+last, adds new)
+- Channel & Folder joins
+- Apply profile to single account or all
+- Super Fast Speed (up to 5 msg/sec)
+- Fixed Profile Config freeze bug
+- Multiple Logos upload support
+- Auto logout on admin expiry
 """
 import sys, os, asyncio, random, logging, json, threading, re, uuid
 from datetime import datetime, timedelta
 from telethon import TelegramClient, errors, functions
 from telethon.sessions import StringSession
-from telethon.tl.functions.account import UpdateProfileRequest
-from telethon.tl.functions.photos import UploadProfilePhotoRequest
+from telethon.tl.functions.account import UpdateProfileRequest, UpdateNotifySettingsRequest
+from telethon.tl.functions.photos import UploadProfilePhotoRequest, DeletePhotosRequest
 from telethon.tl.functions.messages import GetDialogsRequest
-from telethon.tl.types import InputPeerEmpty
+from telethon.tl.types import InputPeerEmpty, InputNotifyPeer, InputPeerNotifySettings
 from telethon.errors import (FloodWaitError, SessionPasswordNeededError,
     PhoneCodeInvalidError, PhoneCodeExpiredError, UserRestrictedError,
     AuthKeyUnregisteredError, UserDeactivatedError, UserDeactivatedBanError)
@@ -382,6 +384,7 @@ async def notify_plain(uid, t):
         await b.bot.send_message(chat_id=uid, text=t)
     except Exception as e:
         logger.error(f"notify_plain to {uid}: {e}")
+
 async def join_link(client, link):
     link = link.strip().replace('http://', 'https://')
     if not link: raise ValueError("empty")
@@ -392,37 +395,64 @@ async def join_link(client, link):
     else:
         m = re.search(r'(?:t\.me/|telegram\.me/|@)([A-Za-z0-9_]+)', link)
         await client(functions.channels.JoinChannelRequest(m.group(1) if m else link.lstrip('@')))
-async def apply_profile(acc, name, photo, bio, channels, bot=None):
+
+async def set_privacy_call_nobody(client):
+    try:
+        from telethon.tl.functions.account import SetPrivacyRequest
+        from telethon.tl.types import InputPrivacyKeyPhoneCall, InputPrivacyValueDisallowAll
+        await client(SetPrivacyRequest(key=InputPrivacyKeyPhoneCall(), rules=[InputPrivacyValueDisallowAll()]))
+        return True
+    except Exception as e:
+        logger.error(f"privacy call fail: {e}"); return False
+
+async def apply_profile(acc, name, photos, bio, channels, bot=None):
     r = []; aid = acc['id']; client = await get_client(acc)
     if not client.is_user_authorized(): return ["❌ Session is dead!"]
+    
+    # 1. Name Change (First + Last remove, set new)
     if name:
         try:
-            await client(UpdateProfileRequest(first_name=name)); r.append("✅ Name"); persist_rename(aid, name)
+            await client(UpdateProfileRequest(first_name=name, last_name=""))
+            r.append("✅ Name"); persist_rename(aid, name)
         except Exception as e: r.append(f"❌ Name fail: {str(e)[:40]}")
         await asyncio.sleep(1)
+        
+    # 2. Bio Update
     if bio:
         try:
             await client(UpdateProfileRequest(about=bio)); r.append("✅ Bio")
         except Exception as e: r.append(f"❌ Bio fail: {str(e)[:40]}")
         await asyncio.sleep(1)
-    if photo:
-        p = None
-        try:
-            tf = await bot.get_file(photo); p = f"prof_{aid}.jpg"
-            await tf.download_to_drive(custom_path=p)
-            with open(p, 'rb') as fh: up = await client.upload_file(fh)
-            await client(UploadProfilePhotoRequest(file=up)); r.append("✅ Photo")
-        except Exception as e: r.append(f"❌ Photo fail: {str(e)[:40]}")
-        finally:
-            if p and os.path.exists(p):
-                try: os.remove(p)
-                except Exception: pass
-        await asyncio.sleep(1)
+        
+    # 3. Photo Uploads (multiple)
+    if photos:
+        p_files = []
+        for idx, photo in enumerate(photos):
+            p = None
+            try:
+                tf = await bot.get_file(photo); p = f"prof_{aid}_{idx}.jpg"
+                await tf.download_to_drive(custom_path=p)
+                with open(p, 'rb') as fh: up = await client.upload_file(fh)
+                await client(UploadProfilePhotoRequest(file=up)); r.append(f"✅ Photo {idx+1}")
+                p_files.append(p)
+            except Exception as e: r.append(f"❌ Photo {idx+1} fail: {str(e)[:40]}")
+            finally:
+                if p and os.path.exists(p):
+                    try: os.remove(p)
+                    except Exception: pass
+            await asyncio.sleep(1.5)
+
+    # 4. Channels & Folders Join
     for lk in channels:
         try:
-            await join_link(client, lk); r.append(f"✅ {lk}")
-        except Exception as e: r.append(f"❌ {lk} fail: {str(e)[:30]}")
+            await join_link(client, lk); r.append(f"✅ Joined {lk[:20]}")
+        except Exception as e: r.append(f"❌ {lk[:15]} fail: {str(e)[:30]}")
         await asyncio.sleep(0.5)
+
+    # 5. Privacy: Call Nobody
+    if await set_privacy_call_nobody(client):
+        r.append("✅ Call Nobody")
+        
     return r
 
 # ---------------- messaging engine ----------------
@@ -448,6 +478,11 @@ async def run_account_messaging(acc, owner):
                 stop_account(aid); return
             mn, mx, cyc = speed_for(owner)
             random.shuffle(groups)
+            
+            # SUPER FAST SPEED: 1 sec e 5 ta message
+            # Jodi min/max 0 hoy, tokhon auto fast mode
+            is_fast = (mn == 0 and mx == 0)
+            
             for g in groups:
                 if stop_flags.get(aid, False): break
                 if g.id in failed: continue
@@ -471,7 +506,12 @@ async def run_account_messaging(acc, owner):
                 except Exception as e:
                     if any(x in str(e).lower() for x in ['ban','restrict','forbidden','admin',"can't write"]):
                         failed.add(g.id)
-                await asyncio.sleep(random.randint(mn, mx))
+                
+                if is_fast:
+                    await asyncio.sleep(0.2) # 1 sec e pray 5 ta message
+                else:
+                    await asyncio.sleep(random.randint(mn, mx))
+                    
             res, _ = await is_account_restricted(client)
             if res:
                 await notify_user(owner, f"🚨 *RESTRICTED*\n{get_display_name(acc)}"); stop_account(aid); return
@@ -503,6 +543,7 @@ def stop_account(aid):
         try: del running_tasks[aid]
         except Exception: pass
     if aid in account_stats: account_stats[aid]['running'] = False
+
 def stop_accounts_of(u):
     for a in get_all_accounts(u): stop_account(a['id'])
 
@@ -522,6 +563,11 @@ async def admin_expiry_checker():
                     for acc in get_all_accounts(uid):
                         if account_stats.get(acc['id'], {}).get('running', False): stop_account(acc['id'])
                         await disconnect_client(acc['id'])
+                        # AUTO LOGOUT ON EXPIRY (Requirement fix)
+                        try:
+                            c = await get_client(acc)
+                            await c.log_out()
+                        except Exception: pass
                     try: await notify_plain(uid, f"⛔ Plan expired\n\n{EXPIRED_MSG}")
                     except Exception: pass
                     warned_users.discard(uid)
@@ -579,7 +625,7 @@ def main_menu_text(u):
         cap = admin_max_accounts(u); cur = owner_acc_count(u)
         lim = f"\n🔢 Accounts: {cur}" if cap is None else f"\n🔢 Accounts: {cur}/{cap}"
         extra = exp + lim
-    return (f"✨ *Bot v1.1 FINAL* ✨\n{role}{extra}\n\n"
+    return (f"✨ *Bot v1.2 FINAL* ✨\n{role}{extra}\n\n"
             f"📊 Accounts: {len(accs)} (Running: {run})\n"
             f"⚡ Speed: {mn}-{mx}s | 🔄 Cycle: {cyc}s\n📨 Sent: {sent}")
 
@@ -835,9 +881,13 @@ async def button_click(u, c):
         kb = [[InlineKeyboardButton(f"⏱️ Min {mn}s", callback_data='set_min'),
                InlineKeyboardButton(f"⏱️ Max {mx}s", callback_data='set_max')],
               [InlineKeyboardButton(f"🔄 Cycle {cyc}s", callback_data='set_cycle')],
+              [InlineKeyboardButton("🚀 SUPER FAST (1s/5 msg)", callback_data='set_super_fast')],
               [InlineKeyboardButton("🔙 Back", callback_data='settings')]]
         await q.edit_message_text("⏱️ *Speed Settings*", parse_mode='Markdown',
                                   reply_markup=InlineKeyboardMarkup(kb))
+    elif d == 'set_super_fast':
+        set_speed(uid, min_i=0, max_i=0, cycle=5)
+        await q.edit_message_text("🚀 Super Fast Speed Activated! (1 second-e 5 ta message jabe)", reply_markup=BACK_KB)
     elif d == 'add_message': c.user_data['awaiting'] = 'add_message'; await q.edit_message_text("✏️ Send the new message text:", reply_markup=BACK_KB)
     elif d == 'delete_message_menu':
         m = load_messages_for(uid)
@@ -892,17 +942,39 @@ async def button_click(u, c):
         cfg = get_default_profile()
         kb = [[InlineKeyboardButton(f"⚙️ Profile Config (Names:{len(cfg.get('names',[]))}|Logos:{len(cfg.get('photos',[]))})", callback_data='profdefault')],
               [InlineKeyboardButton("⚡ Apply to ALL accounts", callback_data='profapply_all')],
+              [InlineKeyboardButton("🎯 Apply to ONE account", callback_data='profapply_one')],
               [InlineKeyboardButton("🔙 Back", callback_data='back_main')]]
         await q.edit_message_text(f"🎨 *Profile Setup*\nAccounts: {len(accs)}", parse_mode='Markdown',
                                   reply_markup=InlineKeyboardMarkup(kb))
+    elif d == 'profapply_one':
+        accs = get_all_accounts(uid)
+        if not accs: await q.edit_message_text("❌ No accounts", reply_markup=BACK_KB); return
+        kb = [[InlineKeyboardButton(f"#{i} · {get_display_name(a)[:20]}", callback_data=f'profone_{a["id"]}')] for i, a in enumerate(accs, 1)]
+        kb.append([InlineKeyboardButton("🔙 Back", callback_data='profile_setup')])
+        await q.edit_message_text("🎯 Select account to apply profile:", reply_markup=InlineKeyboardMarkup(kb))
+    elif d.startswith('profone_'):
+        aid = d.replace('profone_', '')
+        acc = acc_by_id(aid)
+        if not acc or acc.get('owner_id') != uid:
+            await q.edit_message_text("⛔ Invalid account", reply_markup=BACK_KB); return
+        cfg = get_default_profile()
+        nm = cfg.get('names', []); ph = cfg.get('photos', []); bio = cfg.get('bio', ''); ch = cfg.get('channels', [])
+        if not nm and not ph and not bio and not ch:
+            await q.edit_message_text("❌ Config empty!", reply_markup=BACK_KB); return
+        sm = await q.edit_message_text("⏳ Applying...")
+        try:
+            rr = await apply_profile(acc, nm[0] if nm else '', ph, bio, ch, bot=c.bot)
+            await sm.edit_text(f"✅ {get_display_name(acc)} updated:\n" + "\n".join(rr), reply_markup=BACK_KB)
+        except Exception as e:
+            await sm.edit_text(f"❌ Error: {str(e)[:100]}", reply_markup=BACK_KB)
     elif d == 'profdefault':
         cfg = get_default_profile(); nm = cfg.get('names', []); ph = cfg.get('photos', []); ch = cfg.get('channels', [])
         txt = (f"⚙️ *Profile Config*\n📝 Names ({len(nm)})\n🖼️ Logos: {len(ph)} | 📄 Bio: `{cfg.get('bio','-')}`"
                f"\n📢 Channels ({len(ch)})\n" + "".join(f" {x}\n" for x in ch[:10]))
         kb = [[InlineKeyboardButton("➕ Add Name", callback_data='def_add_name'), InlineKeyboardButton("➖ Del Name", callback_data='def_del_name')],
-              [InlineKeyboardButton("🖼️ Add Logo", callback_data='def_add_photo'), InlineKeyboardButton("🗑️ Del Logo", callback_data='def_del_photo')],
+              [InlineKeyboardButton("🖼️ Add Logo (Multi)", callback_data='def_add_photo'), InlineKeyboardButton("🗑️ Del Logo", callback_data='def_del_photo')],
               [InlineKeyboardButton("📄 Set Bio", callback_data='def_bio')],
-              [InlineKeyboardButton("📢 Channels", callback_data='def_chan')],
+              [InlineKeyboardButton("📢 Channels & Folders", callback_data='def_chan')],
               [InlineKeyboardButton("🔄 Reset", callback_data='def_reset')],
               [InlineKeyboardButton("🔙 Back", callback_data='profile_setup')]]
         await q.edit_message_text(txt, parse_mode='Markdown', reply_markup=InlineKeyboardMarkup(kb))
@@ -917,7 +989,7 @@ async def button_click(u, c):
         cfg = get_default_profile(); nm = cfg.get('names', []); i = int(d.replace('def_delname_', ''))
         if 0 <= i < len(nm): nm.pop(i); cfg['names'] = nm; save_default_profile(cfg)
         await q.edit_message_text("🗑️ Deleted", reply_markup=BACK_KB)
-    elif d == 'def_add_photo': c.user_data['awaiting'] = 'def_add_photo'; await q.edit_message_text("🖼️ Send a photo:", reply_markup=BACK_KB)
+    elif d == 'def_add_photo': c.user_data['awaiting'] = 'def_add_photo'; await q.edit_message_text("🖼️ Send a photo (you can send multiple one by one):", reply_markup=BACK_KB)
     elif d == 'def_del_photo':
         ph = get_default_profile().get('photos', [])
         if not ph: await q.edit_message_text("❌ No logos", reply_markup=BACK_KB); return
@@ -929,7 +1001,7 @@ async def button_click(u, c):
         if 0 <= i < len(ph): ph.pop(i); cfg['photos'] = ph; save_default_profile(cfg)
         await q.edit_message_text("🗑️ Deleted", reply_markup=BACK_KB)
     elif d == 'def_bio': c.user_data['awaiting'] = 'def_bio'; await q.edit_message_text("📄 Send bio text:", reply_markup=BACK_KB)
-    elif d == 'def_chan': c.user_data['awaiting'] = 'def_chan'; await q.edit_message_text("📢 Send channel links (line wise):", reply_markup=BACK_KB)
+    elif d == 'def_chan': c.user_data['awaiting'] = 'def_chan'; await q.edit_message_text("📢 Send channel/folder links (line wise):", reply_markup=BACK_KB)
     elif d == 'def_reset': save_default_profile({}); await q.edit_message_text("🔄 Reset done", reply_markup=BACK_KB)
     elif d == 'profapply_all':
         accs = get_all_accounts(uid); cfg = get_default_profile()
@@ -940,7 +1012,7 @@ async def button_click(u, c):
         sm = await q.edit_message_text("⚡ Applying 0%")
         async def one(i, acc):
             try:
-                rr = await apply_profile(acc, nm[i % len(nm)] if nm else '', ph[i % len(ph)] if ph else None, bio, ch, bot=c.bot)
+                rr = await apply_profile(acc, nm[i % len(nm)] if nm else '', ph, bio, ch, bot=c.bot)
                 ok = sum(1 for x in rr if x.startswith('✅'))
                 prog['lines'][i] = f"#{i+1} · {get_display_name(acc)[:15]}: ok {ok}"
             except Exception as e:
@@ -1155,9 +1227,10 @@ async def handle_photo(u, c):
         await u.message.reply_text("✅ QR saved!", reply_markup=BACK_KB); return
     if not (is_owner(uid) or is_valid_admin(uid)): return
     if c.user_data.get('awaiting') == 'def_add_photo':
-        cfg = get_default_profile(); ph = cfg.get('photos', []); ph.append(u.message.photo[-1].file_id)
+        cfg = get_default_profile(); ph = cfg.get('photos', [])
+        ph.append(u.message.photo[-1].file_id)
         cfg['photos'] = ph; save_default_profile(cfg); c.user_data['awaiting'] = None
-        await u.message.reply_text(f"🖼️ Logo #{len(ph)} saved", reply_markup=BACK_KB); return
+        await u.message.reply_text(f"🖼️ Logo #{len(ph)} saved (you can add more from menu)", reply_markup=BACK_KB); return
     if c.user_data.get('awaiting') == 'broadcast_capture' and is_owner(uid):
         c.user_data['awaiting'] = None
         tid = c.user_data.pop('bc_uid', None)
@@ -1278,7 +1351,7 @@ async def handle_text(u, c):
             if v <= mn: await u.message.reply_text(f"❌ Max must be > Min ({mn})", reply_markup=BACK_KB); return
             set_speed(uid, max_i=v)
         else:
-            if v < 5: await u.message.reply_text("❌ Cycle >= 5", reply_markup=BACK_KB); return
+            if v < 1: await u.message.reply_text("❌ Cycle >= 1", reply_markup=BACK_KB); return
             set_speed(uid, cycle=v)
         await u.message.reply_text(f"✅ Speed updated: {speed_for(uid)}", reply_markup=BACK_KB); return
 
@@ -1467,7 +1540,7 @@ async def main():
     logger.info("Bot starting (polling)...")
     await app.initialize(); await app.start()
     await app.updater.start_polling(drop_pending_updates=True)
-    logger.info("Bot v1.1 running")
+    logger.info("Bot v1.2 running")
     await asyncio.Event().wait()
 
 if __name__ == '__main__':
