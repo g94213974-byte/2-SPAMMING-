@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """
-Telegram Mass Messaging Bot v1.4 FINAL
+Telegram Mass Messaging Bot v1.5 FINAL
+- Fixed Account count (0/1 bug) and Delete menu (type mismatch fixed)
+- Fixed Session & OTP Login live UI update (edit message)
 - Shared Folder Link Join (addlist support)
 - Fixed Profile Photo upload delay & verify
-- Fixed Session Add message edit & error handling
 - Call Nobody + Photo/Bio Everybody (Privacy)
 - Name Changer (First+Last removed)
 - Super Fast Speed (5 msg/sec)
@@ -248,7 +249,7 @@ def add_dynamic_account(name, ss, owner_id):
         if a['session'] == ss: return False, "Session already exists!"
     nid = gen_unique_id("acc_dyn", owner_id)
     accs.append({'id': nid, 'name': name, 'api_id': API_ID_1, 'api_hash': API_HASH_1,
-                 'session': ss, 'type': 'dynamic', 'owner_id': owner_id})
+                 'session': ss, 'type': 'dynamic', 'owner_id': int(owner_id)}) # force int
     save_dynamic_accounts(accs); display_names[nid] = name
     return True, nid
 
@@ -256,7 +257,7 @@ def add_phone_auth_account(name, ss, owner_id, phone):
     aus = load_auth_sessions()
     nid = gen_unique_id("ph", owner_id)
     aus.append({'id': nid, 'name': name, 'api_id': API_ID_1, 'api_hash': API_HASH_1,
-                'session_string': ss, 'type': 'phone_auth', 'phone': phone, 'owner_id': owner_id})
+                'session_string': ss, 'type': 'phone_auth', 'phone': phone, 'owner_id': int(owner_id)}) # force int
     save_auth_sessions(aus); display_names[nid] = name
     return nid
 
@@ -264,11 +265,15 @@ def get_all_accounts(user_id=None):
     dyn = load_dynamic_accounts()
     auth = [{'id': s['id'], 'name': s.get('name', f"User_{s.get('owner_id','?')}"),
              'api_id': s['api_id'], 'api_hash': s['api_hash'], 'session': s['session_string'],
-             'type': 'phone_auth', 'phone': s.get('phone', ''), 'owner_id': s.get('owner_id', OWNER_ID)}
+             'type': 'phone_auth', 'phone': s.get('phone', ''), 'owner_id': int(s.get('owner_id', OWNER_ID))}
             for s in load_auth_sessions()]
+            
+    for d in dyn:
+        d['owner_id'] = int(d.get('owner_id', OWNER_ID))
+
     accs = ENV_ACCOUNTS + dyn + auth
-    if user_id is None or user_id == OWNER_ID: return accs
-    return [a for a in accs if a.get('owner_id') == user_id]
+    if user_id is None or int(user_id) == OWNER_ID: return accs
+    return [a for a in accs if a.get('owner_id') == int(user_id)]
 
 def remove_account_by_id(aid):
     global ENV_ACCOUNTS
@@ -393,7 +398,6 @@ async def join_link(client, link):
     link = link.strip().replace('http://', 'https://')
     if not link: raise ValueError("empty link")
     
-    # 1. Shared Folder Link Support
     if 't.me/addlist/' in link:
         m = re.search(r'addlist/([A-Za-z0-9_-]+)', link)
         if not m: raise ValueError("invalid folder link")
@@ -412,7 +416,6 @@ async def join_link(client, link):
         except Exception as e:
             raise ValueError(f"Folder join failed: {str(e)[:30]}")
 
-    # 2. Private Invite Link
     if 't.me/+' in link or 'joinchat' in link:
         m = re.search(r'(?:t\.me/\+|joinchat/)([A-Za-z0-9_-]+)', link)
         if not m: raise ValueError("bad invite link")
@@ -428,7 +431,6 @@ async def join_link(client, link):
                 return "Request sent"
             raise
 
-    # 3. Public Username/Channel
     m = re.search(r'(?:t\.me/|telegram\.me/|@)([A-Za-z0-9_]+)', link)
     if not m: raise ValueError("bad link")
     username = m.group(1)
@@ -476,7 +478,6 @@ async def apply_profile(acc, name, photos, bio, channels, bot=None):
     r = []; aid = acc['id']; client = await get_client(acc)
     if not client.is_user_authorized(): return ["❌ Session is dead!"]
     
-    # 1. Name Change
     if name:
         try:
             await client(UpdateProfileRequest(first_name=name, last_name=""))
@@ -484,14 +485,12 @@ async def apply_profile(acc, name, photos, bio, channels, bot=None):
         except Exception as e: r.append(f"❌ Name fail: {str(e)[:40]}")
         await asyncio.sleep(1)
         
-    # 2. Bio Update
     if bio:
         try:
             await client(UpdateProfileRequest(about=bio)); r.append("✅ Bio text")
         except Exception as e: r.append(f"❌ Bio fail: {str(e)[:40]}")
         await asyncio.sleep(1)
         
-    # 3. Photo Uploads (multiple, keep all)
     if photos:
         try:
             me = await client.get_me()
@@ -512,7 +511,7 @@ async def apply_profile(acc, name, photos, bio, channels, bot=None):
                     up = await client.upload_file(fh)
                 await client(UploadProfilePhotoRequest(file=up))
                 uploaded += 1
-                await asyncio.sleep(2) # Delay for processing
+                await asyncio.sleep(2) 
             except Exception as e:
                 r.append(f"❌ Photo {idx+1}: {str(e)[:30]}")
             finally:
@@ -520,7 +519,6 @@ async def apply_profile(acc, name, photos, bio, channels, bot=None):
                     try: os.remove(p)
                     except Exception: pass
             
-        # Verify photos
         if uploaded > 0:
             await asyncio.sleep(2)
             try:
@@ -533,7 +531,6 @@ async def apply_profile(acc, name, photos, bio, channels, bot=None):
             except Exception:
                 r.append(f"✅ {uploaded} Photo(s) uploaded")
 
-    # 4. Channels & Folders Join
     for lk in channels:
         try:
             status = await join_link(client, lk)
@@ -542,7 +539,6 @@ async def apply_profile(acc, name, photos, bio, channels, bot=None):
             r.append(f"❌ {lk[:15]}: {str(e)[:30]}")
         await asyncio.sleep(1.5)
 
-    # 5. Privacy
     priv_results = await set_privacy_all(client)
     r.extend(priv_results)
         
@@ -714,7 +710,7 @@ def main_menu_text(u):
         cap = admin_max_accounts(u); cur = owner_acc_count(u)
         lim = f"\n🔢 Accounts: {cur}" if cap is None else f"\n🔢 Accounts: {cur}/{cap}"
         extra = exp + lim
-    return (f"✨ *Bot v1.4 FINAL* ✨\n{role}{extra}\n\n"
+    return (f"✨ *Bot v1.5 FINAL* ✨\n{role}{extra}\n\n"
             f"📊 Accounts: {len(accs)} (Running: {run})\n"
             f"⚡ Speed: {mn}-{mx}s | 🔄 Cycle: {cyc}s\n📨 Sent: {sent}")
 
@@ -941,6 +937,7 @@ async def button_click(u, c):
             else: p.append(f"⏸️ Stopped: {get_display_name(a)}")
         await q.edit_message_text("\n".join(p) if p else "✅ Nothing running", reply_markup=BACK_KB)
     elif d == 'status':
+        refresh_account_stats(uid)
         accs = get_all_accounts(uid); txt = "📊 *Status*\n\n"
         for i, a in enumerate(accs, 1):
             st = '🟢 RUNNING' if account_stats.get(a['id'], {}).get('running', False) else '🔴 STOPPED'
@@ -1261,6 +1258,7 @@ async def button_click(u, c):
         c.user_data['awaiting'] = 'add_account'
         await q.edit_message_text("🔑 *Session Login*\nPaste your session string:", parse_mode='Markdown', reply_markup=BACK_KB)
     elif d == 'delete_account':
+        refresh_account_stats(uid)
         accs = get_all_accounts(uid)
         if not accs: await q.edit_message_text("❌ No accounts", reply_markup=BACK_KB); return
         kb = [[InlineKeyboardButton(f"{'💚' if a.get('type')=='env' else '📱' if a.get('type')=='phone_auth' else '💙'} #{i} · {get_display_name(a)[:20]}",
@@ -1327,7 +1325,6 @@ async def handle_photo(u, c):
         ph.append(u.message.photo[-1].file_id)
         cfg['photos'] = ph
         save_default_profile(cfg)
-        # State clear korchi na, jate user onek gulo pathate pare
         await u.message.reply_text(
             f"🖼️ Logo #{len(ph)} saved.\n"
             f"আরও ছবি পাঠাও (একসাথে বা একের পর এক), শেষ হলে Done চাপো।",
@@ -1561,23 +1558,26 @@ async def handle_text(u, c):
     # Session string login
     if aw == 'add_account':
         c.user_data['awaiting'] = None
+        sm = await u.message.reply_text("⏳ Validating session...", reply_markup=BACK_KB)
         try:
             reached, rm = account_limit_reached(uid)
-            if reached: await u.message.reply_text(rm, reply_markup=BACK_KB); return
-            
-            sm = await u.message.reply_text("⏳ Validating session...", reply_markup=BACK_KB)
+            if reached: 
+                await sm.edit_text(rm, reply_markup=BACK_KB); return
             
             if not API_ID_1 or not API_HASH_1:
                 await sm.edit_text("❌ API keys missing!", reply_markup=BACK_KB); return
                 
             tmp = TelegramClient(StringSession(text.strip()), API_ID_1, API_HASH_1, receive_updates=False)
             await tmp.start(); me = await tmp.get_me(); sstr = tmp.session.save(); await tmp.disconnect()
+            
             ok, nid = add_dynamic_account(human_name(me), sstr, uid)
             if not ok: 
                 await sm.edit_text("❌ Already exists", reply_markup=BACK_KB); return
                 
             save_names(); refresh_account_stats(uid)
-            await sm.edit_text(f"✅ Account added: {human_name(me)}", reply_markup=BACK_KB)
+            
+            cnt = len(get_all_accounts(uid))
+            await sm.edit_text(f"✅ Account added: {human_name(me)}\n📊 Total: {cnt}", reply_markup=BACK_KB)
             
         except AuthKeyUnregisteredError:
             await sm.edit_text("❌ Session invalid/expired.", reply_markup=BACK_KB)
@@ -1589,20 +1589,25 @@ async def handle_text(u, c):
 
 # =============== PHONE LOGIN SUCCESS ===============
 async def finish_phone_login(u, c, uid, ph, session_str):
+    sm = await u.message.reply_text("⏳ Saving account...", reply_markup=BACK_KB)
     try:
         reached, rm = account_limit_reached(uid)
         if reached:
-            await u.message.reply_text(rm, reply_markup=BACK_KB); return
+            await sm.edit_text(rm, reply_markup=BACK_KB); return
         if not API_ID_1 or not API_HASH_1:
-            await u.message.reply_text("❌ API keys missing!", reply_markup=BACK_KB); return
+            await sm.edit_text("❌ API keys missing!", reply_markup=BACK_KB); return
+        
         tmp = TelegramClient(StringSession(session_str), API_ID_1, API_HASH_1, receive_updates=False)
         await tmp.start(); me = await tmp.get_me(); name = human_name(me)
         sstr2 = tmp.session.save(); await tmp.disconnect()
+        
         nid = add_phone_auth_account(name, sstr2, uid, ph)
         refresh_account_stats(uid)
-        await u.message.reply_text(f"✅ Logged in: {name} ({ph})", reply_markup=BACK_KB)
+        
+        cnt = len(get_all_accounts(uid))
+        await sm.edit_text(f"✅ Logged in: {name} ({ph})\n📊 Total: {cnt}", reply_markup=BACK_KB)
     except Exception as e:
-        await u.message.reply_text(f"❌ {str(e)[:150]}", reply_markup=BACK_KB)
+        await sm.edit_text(f"❌ {str(e)[:150]}", reply_markup=BACK_KB)
 
 # ---------------- data persistence ----------------
 def load_data():
@@ -1650,7 +1655,7 @@ async def main():
     logger.info("Bot starting (polling)...")
     await app.initialize(); await app.start()
     await app.updater.start_polling(drop_pending_updates=True)
-    logger.info("Bot v1.4 running")
+    logger.info("Bot v1.5 running")
     await asyncio.Event().wait()
 
 if __name__ == '__main__':
